@@ -9,41 +9,6 @@ private enum SongClipGenerationError: Error {
     case missingOutput
 }
 
-private final class ExportSessionCancellationBox: @unchecked Sendable {
-    private let lock = NSLock()
-    private var exportSession: AVAssetExportSession?
-    private var isCancelled = false
-
-    func install(_ exportSession: AVAssetExportSession) {
-        let shouldCancel: Bool
-        lock.lock()
-        shouldCancel = isCancelled
-        if !shouldCancel {
-            self.exportSession = exportSession
-        }
-        lock.unlock()
-
-        if shouldCancel {
-            exportSession.cancelExport()
-        }
-    }
-
-    func clear() {
-        lock.lock()
-        exportSession = nil
-        lock.unlock()
-    }
-
-    func cancel() {
-        let exportSession: AVAssetExportSession?
-        lock.lock()
-        isCancelled = true
-        exportSession = self.exportSession
-        lock.unlock()
-        exportSession?.cancelExport()
-    }
-}
-
 struct SongClipGenerationService: Sendable {
     static let canRequestAppleMusicOfflineDownload = false
 
@@ -199,54 +164,45 @@ struct SongClipGenerationService: Sendable {
         let audioMix = AVMutableAudioMix()
         audioMix.inputParameters = [parameters]
 
-        let cancellationBox = ExportSessionCancellationBox()
-        return try await withTaskCancellationHandler(operation: {
-            try Task.checkCancellation()
-            guard let exportSession = AVAssetExportSession(
-                asset: composition,
-                presetName: AVAssetExportPresetAppleM4A
-            ) else {
-                throw SongClipGenerationError.exportUnavailable
-            }
-            cancellationBox.install(exportSession)
-            defer { cancellationBox.clear() }
+        try Task.checkCancellation()
+        guard let exportSession = AVAssetExportSession(
+            asset: composition,
+            presetName: AVAssetExportPresetAppleM4A
+        ) else {
+            throw SongClipGenerationError.exportUnavailable
+        }
 
-            let generatedDirectory = try AppPaths.generatedClipsDirectory()
-            let fileName = "\(clip.id.uuidString.lowercased())-\(clip.generationKey.prefix(16)).m4a"
-            let destinationURL = generatedDirectory.appendingPathComponent(fileName)
-            let temporaryURL = FileManager.default.temporaryDirectory
-                .appendingPathComponent("RollCallGenerated-\(UUID().uuidString).m4a")
-            try? FileManager.default.removeItem(at: temporaryURL)
-            defer { try? FileManager.default.removeItem(at: temporaryURL) }
+        let generatedDirectory = try AppPaths.generatedClipsDirectory()
+        let fileName = "\(clip.id.uuidString.lowercased())-\(clip.generationKey.prefix(16)).m4a"
+        let destinationURL = generatedDirectory.appendingPathComponent(fileName)
+        let temporaryURL = FileManager.default.temporaryDirectory
+            .appendingPathComponent("RollCallGenerated-\(UUID().uuidString).m4a")
+        try? FileManager.default.removeItem(at: temporaryURL)
+        defer { try? FileManager.default.removeItem(at: temporaryURL) }
 
-            exportSession.audioMix = audioMix
-            exportSession.outputURL = temporaryURL
-            exportSession.outputFileType = .m4a
-            exportSession.shouldOptimizeForNetworkUse = false
-            try await exportSession.export(to: temporaryURL, as: .m4a)
-            try Task.checkCancellation()
-            guard FileManager.default.fileExists(atPath: temporaryURL.path) else {
-                throw SongClipGenerationError.missingOutput
-            }
+        exportSession.audioMix = audioMix
+        exportSession.shouldOptimizeForNetworkUse = false
+        try await exportSession.export(to: temporaryURL, as: .m4a)
+        try Task.checkCancellation()
+        guard FileManager.default.fileExists(atPath: temporaryURL.path) else {
+            throw SongClipGenerationError.missingOutput
+        }
 
-            if FileManager.default.fileExists(atPath: destinationURL.path) {
-                try FileManager.default.removeItem(at: destinationURL)
-            }
-            try FileManager.default.moveItem(at: temporaryURL, to: destinationURL)
+        if FileManager.default.fileExists(atPath: destinationURL.path) {
+            try FileManager.default.removeItem(at: destinationURL)
+        }
+        try FileManager.default.moveItem(at: temporaryURL, to: destinationURL)
 
-            return GeneratedClipAsset(
-                relativePath: "GeneratedClips/\(fileName)",
-                status: .ready,
-                renderedSelection: SongClipSelection(
-                    startTime: requestedStart,
-                    duration: renderedDuration,
-                    fadeOutDuration: fadeOutDuration
-                ),
-                generationKey: clip.generationKey,
-                generatedAt: .now
-            )
-        }, onCancel: {
-            cancellationBox.cancel()
-        })
+        return GeneratedClipAsset(
+            relativePath: "GeneratedClips/\(fileName)",
+            status: .ready,
+            renderedSelection: SongClipSelection(
+                startTime: requestedStart,
+                duration: renderedDuration,
+                fadeOutDuration: fadeOutDuration
+            ),
+            generationKey: clip.generationKey,
+            generatedAt: .now
+        )
     }
 }

@@ -595,12 +595,10 @@ struct AudioAssetService: Sendable {
 
         let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).m4a")
         try? FileManager.default.removeItem(at: tempURL)
-        exportSession.outputURL = tempURL
-        exportSession.outputFileType = .m4a
+        defer { try? FileManager.default.removeItem(at: tempURL) }
         exportSession.shouldOptimizeForNetworkUse = false
 
         try await exportSession.export(to: tempURL, as: .m4a)
-        defer { try? FileManager.default.removeItem(at: tempURL) }
 
         return try storeCopiedAsset(
             from: tempURL,
@@ -1055,6 +1053,7 @@ private final class MediaPlayerCatalogPlaybackController: AppleMusicCatalogPlayb
         }
 
         player.play()
+        try await waitForPlaybackStart()
 
         if startTime > 0 {
             await Task.yield()
@@ -1085,6 +1084,7 @@ private final class MediaPlayerCatalogPlaybackController: AppleMusicCatalogPlayb
         }
 
         player.play()
+        try await waitForPlaybackStart()
 
         if startTime > 0 {
             await Task.yield()
@@ -1120,6 +1120,16 @@ private final class MediaPlayerCatalogPlaybackController: AppleMusicCatalogPlayb
             restoreVolume()
         }
         volumeAutomationEnabledForCurrentCue = false
+    }
+
+    private func waitForPlaybackStart() async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(3))
+        while clock.now < deadline {
+            if player.playbackState == .playing { return }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        throw PlaybackStartFailure(reason: .startTimedOut)
     }
 
     private func captureSystemVolumeBaseline() {
@@ -1176,6 +1186,10 @@ struct PlaybackFadeSchedule: Equatable {
     }
 }
 
+private struct PlaybackStartFailure: Error {
+    let reason: PlaybackFailureReason
+}
+
 @MainActor
 final class CuePlaybackEngine: NSObject, ObservableObject {
     @Published private(set) var activeCueID: UUID?
@@ -1201,6 +1215,7 @@ final class CuePlaybackEngine: NSObject, ObservableObject {
     private var lastStartDate: Date?
     private var lastStartedCueID: UUID?
     private var sourceBackedVolumeAutomationEnabledForCurrentCue = false
+    var onAsynchronousPlaybackResult: ((PlaybackStartConfirmation) -> Void)?
 
     init(
         audioAssetService: AudioAssetService,
@@ -1211,20 +1226,24 @@ final class CuePlaybackEngine: NSObject, ObservableObject {
         self.catalogPlaybackController = MediaPlayerCatalogPlaybackController()
     }
 
+    @discardableResult
     func play(
         cue: Cue,
         announcerRelativePath: String? = nil,
-        fadeOutVolumeAutomationEnabled: Bool = true
-    ) async throws {
+        fadeOutVolumeAutomationEnabled: Bool = true,
+        sourceFamilyOverride: PlaybackSourceFamily? = nil
+    ) async throws -> PlaybackRequestResult {
         if activeCueID == cue.id {
             stop()
-            return
+            let requestID = UUID()
+            return PlaybackRequestResult(requestID: requestID, confirmations: [PlaybackStartConfirmation(requestID: requestID, component: .primaryCue, sourceFamily: .unknown, outcome: .cancelled)], wasDebounced: false)
         }
         if let lastStartDate,
            let lastStartedCueID,
            lastStartedCueID == cue.id,
            Date().timeIntervalSince(lastStartDate) < debounceWindow {
-            return
+            let requestID = UUID()
+            return PlaybackRequestResult(requestID: requestID, confirmations: [], wasDebounced: true)
         }
         let sessionID = beginPlayback(
             activeCueID: cue.id,
@@ -1235,32 +1254,35 @@ final class CuePlaybackEngine: NSObject, ObservableObject {
         lastStartDate = Date()
         lastStartedCueID = cue.id
         do {
-            try await playCueSequence(
+            let confirmations = try await playCueSequence(
                 cue,
                 announcerRelativePath: announcerRelativePath,
                 fadeOutVolumeAutomationEnabled: fadeOutVolumeAutomationEnabled,
-                sessionID: sessionID
+                sessionID: sessionID,
+                sourceFamilyOverride: sourceFamilyOverride
             )
+            return PlaybackRequestResult(requestID: sessionID, confirmations: confirmations, wasDebounced: false)
         } catch {
             stopIfCurrent(sessionID: sessionID)
             throw error
         }
     }
 
+    @discardableResult
     func playAsset(
         relativePath: String,
         activeCueID: UUID,
         fadeOutVolumeAutomationEnabled: Bool = true
-    ) async throws {
+    ) async throws -> PlaybackRequestResult {
         if self.activeCueID == activeCueID {
             stop()
-            return
+            return PlaybackRequestResult(requestID: UUID(), confirmations: [], wasDebounced: false)
         }
         if let lastStartDate,
            let lastStartedCueID,
            lastStartedCueID == activeCueID,
            Date().timeIntervalSince(lastStartDate) < debounceWindow {
-            return
+            return PlaybackRequestResult(requestID: UUID(), confirmations: [], wasDebounced: true)
         }
         let sessionID = beginPlayback(
             activeCueID: activeCueID,
@@ -1277,7 +1299,7 @@ final class CuePlaybackEngine: NSObject, ObservableObject {
             guard player.play() else {
                 announcerPlayer = nil
                 stopIfCurrent(sessionID: sessionID)
-                return
+                throw PlaybackStartFailure(reason: .startRejected)
             }
 
             stopTask = Task { [weak self] in
@@ -1289,6 +1311,8 @@ final class CuePlaybackEngine: NSObject, ObservableObject {
             stopIfCurrent(sessionID: sessionID)
             throw error
         }
+        let confirmation = PlaybackStartConfirmation(requestID: sessionID, component: .announcement, sourceFamily: .recordedAnnouncement, outcome: .started)
+        return PlaybackRequestResult(requestID: sessionID, confirmations: [confirmation], wasDebounced: false)
     }
 
     func prewarm(cue: Cue) async throws {
@@ -1414,54 +1438,74 @@ final class CuePlaybackEngine: NSObject, ObservableObject {
         _ cue: Cue,
         announcerRelativePath: String?,
         fadeOutVolumeAutomationEnabled: Bool,
-        sessionID: UUID
-    ) async throws {
+        sessionID: UUID,
+        sourceFamilyOverride: PlaybackSourceFamily?
+    ) async throws -> [PlaybackStartConfirmation] {
         if let relativePath = announcerRelativePath {
             try? await prewarm(cue: cue)
-            guard playbackSessionID == sessionID else { return }
+            guard playbackSessionID == sessionID else {
+                return [PlaybackStartConfirmation(requestID: sessionID, component: .primaryCue, sourceFamily: .unknown, outcome: .cancelled)]
+            }
 
             let announcerURL = try audioAssetService.assetURL(relativePath: relativePath)
             guard FileManager.default.fileExists(atPath: announcerURL.path) else {
-                try await startPrimaryCue(
+                let primary = try await startPrimaryCue(
                     cue,
                     fadeOutVolumeAutomationEnabled: fadeOutVolumeAutomationEnabled,
-                    sessionID: sessionID
+                    sessionID: sessionID,
+                    sourceFamilyOverride: sourceFamilyOverride
                 )
-                return
+                return [
+                    PlaybackStartConfirmation(requestID: sessionID, component: .announcement, sourceFamily: .recordedAnnouncement, outcome: .failed(.missingAsset)),
+                    primary
+                ]
             }
 
             let player: AVAudioPlayer
             do {
                 player = try AVAudioPlayer(contentsOf: announcerURL)
             } catch {
-                try await startPrimaryCue(
+                let primary = try await startPrimaryCue(
                     cue,
                     fadeOutVolumeAutomationEnabled: fadeOutVolumeAutomationEnabled,
-                    sessionID: sessionID
+                    sessionID: sessionID,
+                    sourceFamilyOverride: sourceFamilyOverride
                 )
-                return
+                return [
+                    PlaybackStartConfirmation(requestID: sessionID, component: .announcement, sourceFamily: .recordedAnnouncement, outcome: .failed(.unreadableAsset)),
+                    primary
+                ]
             }
             announcerPlayer = player
             player.prepareToPlay()
             guard player.play() else {
                 announcerPlayer = nil
-                try await startPrimaryCue(
+                let primary = try await startPrimaryCue(
                     cue,
                     fadeOutVolumeAutomationEnabled: fadeOutVolumeAutomationEnabled,
-                    sessionID: sessionID
+                    sessionID: sessionID,
+                    sourceFamilyOverride: sourceFamilyOverride
                 )
-                return
+                return [
+                    PlaybackStartConfirmation(requestID: sessionID, component: .announcement, sourceFamily: .recordedAnnouncement, outcome: .failed(.startRejected)),
+                    primary
+                ]
             }
 
             guard player.duration.isFinite, player.duration >= 0 else {
-                try await startPrimaryCue(
+                let primary = try await startPrimaryCue(
                     cue,
                     fadeOutVolumeAutomationEnabled: fadeOutVolumeAutomationEnabled,
-                    sessionID: sessionID
+                    sessionID: sessionID,
+                    sourceFamilyOverride: sourceFamilyOverride
                 )
-                return
+                return [
+                    PlaybackStartConfirmation(requestID: sessionID, component: .announcement, sourceFamily: .recordedAnnouncement, outcome: .failed(.unreadableAsset)),
+                    primary
+                ]
             }
 
+            let announcement = PlaybackStartConfirmation(requestID: sessionID, component: .announcement, sourceFamily: .recordedAnnouncement, outcome: .started)
             stopTask = Task { [weak self] in
                 await self?.waitForAnnouncerPlaybackToFinish(player)
                 guard let self, !Task.isCancelled, self.playbackSessionID == sessionID else { return }
@@ -1471,25 +1515,37 @@ final class CuePlaybackEngine: NSObject, ObservableObject {
                     guard !Task.isCancelled, self.playbackSessionID == sessionID else { return }
                 }
                 do {
-                    try await self.startPrimaryCue(
+                    let result = try await self.startPrimaryCue(
                         cue,
                         cancelPendingStopTask: false,
                         fadeOutVolumeAutomationEnabled: fadeOutVolumeAutomationEnabled,
                         setsInitialVolumeToMax: false,
-                        sessionID: sessionID
+                        sessionID: sessionID,
+                        sourceFamilyOverride: sourceFamilyOverride
                     )
+                    self.onAsynchronousPlaybackResult?(result)
                 } catch {
+                    self.onAsynchronousPlaybackResult?(
+                        PlaybackStartConfirmation(
+                            requestID: sessionID,
+                            component: .primaryCue,
+                            sourceFamily: sourceFamilyOverride ?? self.sourceFamily(for: cue),
+                            outcome: .failed(self.playbackFailureReason(for: error))
+                        )
+                    )
                     self.stopIfCurrent(sessionID: sessionID)
                 }
             }
-            return
+            return [announcement]
         }
 
-        try await startPrimaryCue(
+        let primary = try await startPrimaryCue(
             cue,
             fadeOutVolumeAutomationEnabled: fadeOutVolumeAutomationEnabled,
-            sessionID: sessionID
+            sessionID: sessionID,
+            sourceFamilyOverride: sourceFamilyOverride
         )
+        return [primary]
     }
 
     private func startPrimaryCue(
@@ -1497,9 +1553,12 @@ final class CuePlaybackEngine: NSObject, ObservableObject {
         cancelPendingStopTask: Bool = true,
         fadeOutVolumeAutomationEnabled: Bool,
         setsInitialVolumeToMax: Bool = true,
-        sessionID: UUID
-    ) async throws {
-        guard playbackSessionID == sessionID else { return }
+        sessionID: UUID,
+        sourceFamilyOverride: PlaybackSourceFamily? = nil
+    ) async throws -> PlaybackStartConfirmation {
+        guard playbackSessionID == sessionID else {
+            return PlaybackStartConfirmation(requestID: sessionID, component: .primaryCue, sourceFamily: sourceFamily(for: cue), outcome: .cancelled)
+        }
         if cancelPendingStopTask {
             stopTask?.cancel()
             stopTask = nil
@@ -1523,12 +1582,17 @@ final class CuePlaybackEngine: NSObject, ObservableObject {
                     fadeOutVolumeAutomationEnabled: fadeOutVolumeAutomationEnabled,
                     setsInitialVolumeToMax: setsInitialVolumeToMax,
                     sessionID: sessionID
-                )
-                return
+                    )
+                    guard playbackSessionID == sessionID else {
+                        return PlaybackStartConfirmation(requestID: sessionID, component: .primaryCue, sourceFamily: sourceFamily(for: cue), outcome: .cancelled)
+                    }
+                    return PlaybackStartConfirmation(requestID: sessionID, component: .primaryCue, sourceFamily: .musicLibrary, outcome: .started)
             }
 
             if source.isCatalogBacked != false, await musicCatalogService.playbackCapability() == .fullSong {
-                guard playbackSessionID == sessionID else { return }
+                guard playbackSessionID == sessionID else {
+                    return PlaybackStartConfirmation(requestID: sessionID, component: .primaryCue, sourceFamily: .appleMusicCatalog, outcome: .cancelled)
+                }
                 do {
                     try await playCatalogSong(
                         source: source,
@@ -1539,7 +1603,10 @@ final class CuePlaybackEngine: NSObject, ObservableObject {
                         setsInitialVolumeToMax: setsInitialVolumeToMax,
                         sessionID: sessionID
                     )
-                    return
+                    guard playbackSessionID == sessionID else {
+                        return PlaybackStartConfirmation(requestID: sessionID, component: .primaryCue, sourceFamily: sourceFamily(for: cue), outcome: .cancelled)
+                    }
+                    return PlaybackStartConfirmation(requestID: sessionID, component: .primaryCue, sourceFamily: .appleMusicCatalog, outcome: .started)
                 } catch {
                     throw AppError.appleMusicFullSongCatalogUnavailable
                 }
@@ -1550,22 +1617,30 @@ final class CuePlaybackEngine: NSObject, ObservableObject {
             remotePlayer = player
             let maxPreviewStart = max(0, appleMusicClipDurationLimit - clipDuration)
             let previewStart = min(max(0, cue.startTime), maxPreviewStart)
-            player.seek(to: CMTime(seconds: previewStart, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak player] _ in
-                Task { @MainActor [weak self, weak player] in
-                    guard self?.playbackSessionID == sessionID else { return }
-                    if fadeOutVolumeAutomationEnabled, setsInitialVolumeToMax {
-                        player?.volume = 1
+            await withCheckedContinuation { (continuation: CheckedContinuation<Void, Never>) in
+                player.seek(to: CMTime(seconds: previewStart, preferredTimescale: 600), toleranceBefore: .zero, toleranceAfter: .zero) { [weak self, weak player] _ in
+                    Task { @MainActor [weak self, weak player] in
+                        guard let self, self.playbackSessionID == sessionID else {
+                            continuation.resume()
+                            return
+                        }
+                        if fadeOutVolumeAutomationEnabled, setsInitialVolumeToMax {
+                            player?.volume = 1
+                        }
+                        player?.play()
+                        continuation.resume()
                     }
-                    player?.play()
-                    self?.startProgressTracking(duration: clipDuration, sessionID: sessionID)
                 }
             }
+            try await waitForRemotePlaybackStart(player, sessionID: sessionID)
+            startProgressTracking(duration: clipDuration, sessionID: sessionID)
             scheduleRemoteStop(
                 duration: clipDuration,
                 fadeOut: cue.fadeOutDuration,
                 fadeOutVolumeAutomationEnabled: fadeOutVolumeAutomationEnabled,
                 sessionID: sessionID
             )
+            return PlaybackStartConfirmation(requestID: sessionID, component: .primaryCue, sourceFamily: .appleMusicPreview, outcome: .started)
         case .localAudio(let source):
             let url = try audioAssetService.assetURL(relativePath: source.relativePath)
             try playLocal(
@@ -1575,6 +1650,7 @@ final class CuePlaybackEngine: NSObject, ObservableObject {
                 reusePrewarm: prewarmedCueID == cue.id,
                 sessionID: sessionID
             )
+            return PlaybackStartConfirmation(requestID: sessionID, component: .primaryCue, sourceFamily: sourceFamilyOverride ?? .importedLocal, outcome: .started)
         case .builtInClip(let source):
             let url = try audioAssetService.assetURL(relativePath: builtInClipRelativePath(for: source))
             try playLocal(
@@ -1584,6 +1660,7 @@ final class CuePlaybackEngine: NSObject, ObservableObject {
                 reusePrewarm: prewarmedCueID == cue.id,
                 sessionID: sessionID
             )
+            return PlaybackStartConfirmation(requestID: sessionID, component: .primaryCue, sourceFamily: sourceFamilyOverride ?? .builtinIntentional, outcome: .started)
         }
     }
 
@@ -1667,12 +1744,49 @@ final class CuePlaybackEngine: NSObject, ObservableObject {
         }
         audioPlayer = player
         player.currentTime = start
-        player.play()
+        guard player.play() else { throw PlaybackStartFailure(reason: .startRejected) }
         startProgressTracking(duration: duration, sessionID: sessionID)
         scheduleLocalStop(
             duration: duration,
             sessionID: sessionID
         )
+    }
+
+    private func sourceFamily(for cue: Cue) -> PlaybackSourceFamily {
+        switch cue.source {
+        case .appleMusic(let source):
+            if source.libraryPersistentID != nil, source.isCatalogBacked == false { return .musicLibrary }
+            return source.isCatalogBacked == false ? .appleMusicPreview : .appleMusicCatalog
+        case .localAudio:
+            return .importedLocal
+        case .builtInClip:
+            return .builtin
+        }
+    }
+
+    func playbackFailureReason(for error: Error) -> PlaybackFailureReason {
+        if let failure = error as? PlaybackStartFailure { return failure.reason }
+        if let appError = error as? AppError {
+            switch appError {
+            case .missingPreview: return .sourceUnavailable
+            case .appleMusicFullSongCatalogUnavailable: return .sourceUnavailable
+            default: return .playbackError
+            }
+        }
+        return .playbackError
+    }
+
+    private func waitForRemotePlaybackStart(_ player: AVPlayer, sessionID: UUID) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(3))
+        while clock.now < deadline {
+            guard playbackSessionID == sessionID else {
+                throw PlaybackStartFailure(reason: .startTimedOut)
+            }
+            if player.timeControlStatus == .playing { return }
+            try await Task.sleep(for: .milliseconds(50))
+        }
+        throw PlaybackStartFailure(reason: .startTimedOut)
     }
 
     private func scheduleLocalStop(duration: TimeInterval, sessionID: UUID) {
@@ -2067,7 +2181,7 @@ struct PackageService: Sendable {
         defer { try? FileManager.default.removeItem(at: stagingDirectory) }
 
         let manifest = TeamPackageManifest(
-            schemaVersion: state.schemaVersion,
+            schemaVersion: TeamPackageManifest.currentSchemaVersion,
             appVersion: state.appVersion,
             exportedAt: .now,
             deviceLabel: state.deviceIdentity.label,
@@ -2113,7 +2227,7 @@ struct PackageService: Sendable {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         var manifest = try decoder.decode(TeamPackageManifest.self, from: Data(contentsOf: manifestURL))
-        guard manifest.schemaVersion <= AppState.currentSchemaVersion else { throw AppError.unsupportedImportVersion }
+        guard manifest.schemaVersion <= TeamPackageManifest.currentSchemaVersion else { throw AppError.unsupportedImportVersion }
         try validateImportableTeam(manifest.team)
 
         let packageAssetsURL = packageRootURL.appendingPathComponent("Assets", isDirectory: true)
@@ -2197,7 +2311,7 @@ struct PackageService: Sendable {
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
         let manifest = try decoder.decode(TeamPackageManifest.self, from: Data(contentsOf: manifestURL))
-        guard manifest.schemaVersion <= AppState.currentSchemaVersion else { throw AppError.unsupportedImportVersion }
+        guard manifest.schemaVersion <= TeamPackageManifest.currentSchemaVersion else { throw AppError.unsupportedImportVersion }
         try validateImportableTeam(manifest.team)
         let packageAssetsURL = packageRootURL.appendingPathComponent("Assets", isDirectory: true)
         let states = try uniqueSongClips(in: manifest.team).map {
@@ -2237,6 +2351,16 @@ struct PackageService: Sendable {
             if let photoPath = player.photoRelativePath,
                try packageAssetURLIfPresent(relativePath: photoPath, from: packageAssetsDirectory) == nil {
                 items.append(.init(id: UUID(), destination: .player(player.id), title: "\(player.displayName) — Photo", state: .needsRepair, detail: "The package references a player photo, but its file was not included. Open the player to add it again."))
+            }
+            if let sourcePath = player.photoSourceRelativePath,
+               try packageAssetURLIfPresent(relativePath: sourcePath, from: packageAssetsDirectory) == nil {
+                items.append(.init(
+                    id: UUID(),
+                    destination: .player(player.id),
+                    title: "\(player.displayName) — Photo Source",
+                    state: .photoSourceMissing,
+                    detail: "The compact photo is still usable, but the wider photo source was not included. Player Card framing will use the available profile photo until it is replaced."
+                ))
             }
             if let announcementPath = player.customAnnouncerRelativePath,
                try packageAssetURLIfPresent(relativePath: announcementPath, from: packageAssetsDirectory) == nil {
@@ -2488,6 +2612,9 @@ struct PackageService: Sendable {
             if let photoRelativePath = player.photoRelativePath {
                 try copyAssetIfPresent(relativePath: photoRelativePath, into: assetsDirectory)
             }
+            if let photoSourceRelativePath = player.photoSourceRelativePath {
+                try copyAssetIfPresent(relativePath: photoSourceRelativePath, into: assetsDirectory)
+            }
             try copyAssetIfPresent(relativePath: player.customAnnouncerRelativePath, into: assetsDirectory)
         }
     }
@@ -2539,6 +2666,15 @@ struct PackageService: Sendable {
                 player.photoRelativePath = try importPhotoIfPresent(relativePath: photoRelativePath, from: packageAssetsDirectory)
                 if let importedPhotoPath = player.photoRelativePath {
                     importedAssetPaths.append(importedPhotoPath)
+                }
+            }
+            if let photoSourceRelativePath = player.photoSourceRelativePath {
+                player.photoSourceRelativePath = try importPhotoIfPresent(relativePath: photoSourceRelativePath, from: packageAssetsDirectory)
+                if let importedSourcePath = player.photoSourceRelativePath {
+                    importedAssetPaths.append(importedSourcePath)
+                } else {
+                    player.profilePhotoCrop = nil
+                    player.playerCardPhotoCrop = nil
                 }
             }
             if case .privateClip(let clip)? = player.songAssignment {

@@ -190,7 +190,7 @@ enum GameDayAnnouncerMode: String, Codable, CaseIterable, Identifiable {
     }
 }
 
-enum TeamAccentPreset: String, Codable, CaseIterable, Identifiable {
+enum TeamAccentPreset: String, Codable, CaseIterable, Identifiable, Sendable {
     case rollCallOrange
     case red
     case gold
@@ -306,6 +306,11 @@ struct Player: Codable, Equatable, Identifiable {
     var uniformNumber: String
     var pronunciationOverride: String
     var photoRelativePath: String?
+    /// A metadata-stripped, orientation-normalized working master for new photos.
+    /// Legacy players may have only `photoRelativePath`.
+    var photoSourceRelativePath: String?
+    var profilePhotoCrop: NormalizedPhotoCrop?
+    var playerCardPhotoCrop: NormalizedPhotoCrop?
     var songAssignment: SongAssignment?
     var cue: Cue? {
         get {
@@ -324,6 +329,9 @@ struct Player: Codable, Equatable, Identifiable {
         case uniformNumber
         case pronunciationOverride
         case photoRelativePath
+        case photoSourceRelativePath
+        case profilePhotoCrop
+        case playerCardPhotoCrop
         case cue
         case songAssignment
         case isPresent
@@ -337,6 +345,9 @@ struct Player: Codable, Equatable, Identifiable {
         uniformNumber: String,
         pronunciationOverride: String,
         photoRelativePath: String?,
+        photoSourceRelativePath: String? = nil,
+        profilePhotoCrop: NormalizedPhotoCrop? = nil,
+        playerCardPhotoCrop: NormalizedPhotoCrop? = nil,
         cue: Cue?,
         isPresent: Bool,
         customAnnouncerRelativePath: String? = nil,
@@ -347,6 +358,9 @@ struct Player: Codable, Equatable, Identifiable {
         self.uniformNumber = uniformNumber
         self.pronunciationOverride = pronunciationOverride
         self.photoRelativePath = photoRelativePath
+        self.photoSourceRelativePath = photoSourceRelativePath
+        self.profilePhotoCrop = profilePhotoCrop
+        self.playerCardPhotoCrop = playerCardPhotoCrop
         self.songAssignment = cue.map { .privateClip(SongClip(cue: $0)) }
         self.isPresent = isPresent
         self.customAnnouncerRelativePath = customAnnouncerRelativePath
@@ -360,6 +374,9 @@ struct Player: Codable, Equatable, Identifiable {
         uniformNumber = try container.decodeIfPresent(String.self, forKey: .uniformNumber) ?? ""
         pronunciationOverride = try container.decodeIfPresent(String.self, forKey: .pronunciationOverride) ?? ""
         photoRelativePath = try container.decodeIfPresent(String.self, forKey: .photoRelativePath)
+        photoSourceRelativePath = try container.decodeIfPresent(String.self, forKey: .photoSourceRelativePath)
+        profilePhotoCrop = try container.decodeIfPresent(NormalizedPhotoCrop.self, forKey: .profilePhotoCrop)
+        playerCardPhotoCrop = try container.decodeIfPresent(NormalizedPhotoCrop.self, forKey: .playerCardPhotoCrop)
         if container.contains(.songAssignment) {
             if try container.decodeNil(forKey: .songAssignment) {
                 songAssignment = nil
@@ -388,6 +405,9 @@ struct Player: Codable, Equatable, Identifiable {
         try container.encode(uniformNumber, forKey: .uniformNumber)
         try container.encode(pronunciationOverride, forKey: .pronunciationOverride)
         try container.encodeIfPresent(photoRelativePath, forKey: .photoRelativePath)
+        try container.encodeIfPresent(photoSourceRelativePath, forKey: .photoSourceRelativePath)
+        try container.encodeIfPresent(profilePhotoCrop, forKey: .profilePhotoCrop)
+        try container.encodeIfPresent(playerCardPhotoCrop, forKey: .playerCardPhotoCrop)
         if let songAssignment {
             try container.encode(songAssignment, forKey: .songAssignment)
         }
@@ -431,12 +451,18 @@ struct PlayerEditorDraftState: Equatable {
     var displayName: String
     var uniformNumber: String
     var photoRelativePath: String?
+    var photoSourceRelativePath: String?
+    var profilePhotoCrop: NormalizedPhotoCrop?
+    var playerCardPhotoCrop: NormalizedPhotoCrop?
     var cueTiming: CueTiming?
 
     init(player: Player) {
         displayName = player.displayName
         uniformNumber = player.uniformNumber
         photoRelativePath = player.photoRelativePath
+        photoSourceRelativePath = player.photoSourceRelativePath
+        profilePhotoCrop = player.profilePhotoCrop
+        playerCardPhotoCrop = player.playerCardPhotoCrop
         cueTiming = player.cue.map {
             CueTiming(
                 id: $0.id,
@@ -1099,12 +1125,13 @@ struct RatingRequestState: Codable, Equatable {
 }
 
 struct AppState: Codable, Equatable {
-    static let currentSchemaVersion = 9
+    static let currentSchemaVersion = 10
 
     var schemaVersion: Int
     var appVersion: String
     var deviceIdentity: DeviceIdentity
     var selectedTeamID: UUID?
+    var lastGameDayTeamID: UUID?
     var teams: [Team]
     var recentlyDeleted: [RecentlyDeletedItem]
     var snapshots: [SnapshotRecord]
@@ -1122,6 +1149,7 @@ struct AppState: Codable, Equatable {
         case appVersion
         case deviceIdentity
         case selectedTeamID
+        case lastGameDayTeamID
         case teams
         case recentlyDeleted
         case snapshots
@@ -1140,6 +1168,7 @@ struct AppState: Codable, Equatable {
         appVersion: String,
         deviceIdentity: DeviceIdentity,
         selectedTeamID: UUID?,
+        lastGameDayTeamID: UUID? = nil,
         teams: [Team],
         recentlyDeleted: [RecentlyDeletedItem],
         snapshots: [SnapshotRecord],
@@ -1156,6 +1185,7 @@ struct AppState: Codable, Equatable {
         self.appVersion = appVersion
         self.deviceIdentity = deviceIdentity
         self.selectedTeamID = selectedTeamID
+        self.lastGameDayTeamID = lastGameDayTeamID
         self.teams = teams
         self.recentlyDeleted = recentlyDeleted
         self.snapshots = snapshots
@@ -1175,6 +1205,7 @@ struct AppState: Codable, Equatable {
         appVersion = try container.decodeIfPresent(String.self, forKey: .appVersion) ?? AppMetadata.appVersion
         deviceIdentity = try container.decodeIfPresent(DeviceIdentity.self, forKey: .deviceIdentity) ?? DeviceIdentity(label: "This iPhone")
         selectedTeamID = try container.decodeIfPresent(UUID.self, forKey: .selectedTeamID)
+        lastGameDayTeamID = try container.decodeIfPresent(UUID.self, forKey: .lastGameDayTeamID)
         teams = try container.decodeIfPresent([Team].self, forKey: .teams) ?? []
         recentlyDeleted = try container.decodeIfPresent([RecentlyDeletedItem].self, forKey: .recentlyDeleted) ?? []
         snapshots = try container.decodeIfPresent([SnapshotRecord].self, forKey: .snapshots) ?? []
@@ -1197,6 +1228,7 @@ struct AppState: Codable, Equatable {
         appVersion: AppMetadata.appVersion,
         deviceIdentity: DeviceIdentity(label: "This iPhone"),
         selectedTeamID: nil,
+        lastGameDayTeamID: nil,
         teams: [],
         recentlyDeleted: [],
         snapshots: [],
@@ -1212,6 +1244,10 @@ struct AppState: Codable, Equatable {
 }
 
 struct TeamPackageManifest: Codable {
+    /// Kept independent from `AppState.currentSchemaVersion` so additive app-state
+    /// migrations do not unnecessarily break team-package compatibility.
+    static let currentSchemaVersion = 9
+
     var schemaVersion: Int
     var appVersion: String
     var exportedAt: Date
@@ -1307,6 +1343,10 @@ enum AppPaths {
     static func unreadableStateRecoveryURL() throws -> URL {
         let fileName = "state-unreadable-\(UUID().uuidString).json"
         return try baseDirectory().appendingPathComponent(fileName)
+    }
+
+    static func telemetryStateURL() throws -> URL {
+        try baseDirectory().appendingPathComponent("telemetry-state.json")
     }
 
     static func assetsDirectory() throws -> URL {

@@ -19,6 +19,23 @@ private actor PreparationWaitProbe {
     }
 }
 
+private actor CancellationStartGate {
+    private(set) var isWaiting = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        isWaiting = true
+        await withCheckedContinuation { continuation in
+            self.continuation = continuation
+        }
+    }
+
+    func release() {
+        continuation?.resume()
+        continuation = nil
+    }
+}
+
 final class SongClipGenerationTests: XCTestCase {
     private var temp: RollCallTemporaryDirectory!
 
@@ -64,10 +81,14 @@ final class SongClipGenerationTests: XCTestCase {
     }
 
     @MainActor
-    func testCoordinatorCancellationDoesNotApplyLatePreparationOutcome() async {
+    func testCoordinatorCancellationDiscardsAndRemovesLateGeneratedOutcome() async throws {
         let probe = PreparationProbe()
         var clip = SongClip(cue: RollCallTestFixtures.localCue())
         clip.id = UUID()
+        let generatedRelativePath = "GeneratedClips/cancelled.m4a"
+        let generatedURL = try AppPaths.assetURL(relativePath: generatedRelativePath)
+        try Data("cancelled-generated-audio".utf8).write(to: generatedURL)
+        let generationKey = clip.generationKey
         let request = SongClipPreparationRequest(
             id: UUID(),
             teamID: RollCallTestFixtures.teamID,
@@ -82,7 +103,19 @@ final class SongClipGenerationTests: XCTestCase {
             prepare: { _ in
                 await probe.markStarted()
                 try? await Task.sleep(for: .seconds(30))
-                return .sourceBacked(downloadedOnDevice: true)
+                return .generated(
+                    GeneratedClipAsset(
+                        relativePath: generatedRelativePath,
+                        status: .ready,
+                        renderedSelection: SongClipSelection(
+                            startTime: 0,
+                            duration: 1,
+                            fadeOutDuration: 0
+                        ),
+                        generationKey: generationKey,
+                        generatedAt: RollCallTestFixtures.now
+                    )
+                )
             }
         )
         var appliedOutcomes = 0
@@ -96,9 +129,9 @@ final class SongClipGenerationTests: XCTestCase {
             )
         }
 
-        for _ in 0..<20 {
+        for _ in 0..<200 {
             if await probe.didStart { break }
-            try? await Task.sleep(for: .milliseconds(10))
+            try? await Task.sleep(for: .milliseconds(25))
         }
         let didStart = await probe.didStart
         XCTAssertTrue(didStart)
@@ -107,6 +140,7 @@ final class SongClipGenerationTests: XCTestCase {
         await runner.value
 
         XCTAssertEqual(appliedOutcomes, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: generatedURL.path))
         let pendingCount = await coordinator.pendingCount()
         XCTAssertEqual(pendingCount, 0)
     }
@@ -923,6 +957,69 @@ final class SongClipGenerationTests: XCTestCase {
         XCTAssertEqual(outcome, .failed(code: .renderFailed, retryable: true))
     }
 
+    func testAlreadyCancelledGenerationCreatesNoTemporaryOrFinalOutput() async throws {
+        let relativePath = "cancel-before-start.caf"
+        try writeSilentAudio(
+            to: AppPaths.assetURL(relativePath: relativePath),
+            duration: 1
+        )
+        let clip = SongClip(cue: RollCallTestFixtures.localCue(relativePath: relativePath))
+        let expectedGeneratedURL = try generatedURL(for: clip)
+        let temporaryFilesBefore = try generatedTemporaryFiles()
+        let gate = CancellationStartGate()
+        let task = Task {
+            await gate.wait()
+            return await SongClipGenerationService().prepare(clip)
+        }
+
+        for _ in 0..<200 {
+            if await gate.isWaiting { break }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        let isWaiting = await gate.isWaiting
+        XCTAssertTrue(isWaiting)
+
+        task.cancel()
+        await gate.release()
+        let outcome = await task.value
+
+        XCTAssertEqual(outcome, .failed(code: .renderFailed, retryable: true))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: expectedGeneratedURL.path))
+        XCTAssertEqual(try generatedTemporaryFiles(), temporaryFilesBefore)
+    }
+
+    func testCancellingInFlightGenerationStopsAndCleansOutput() async throws {
+        let relativePath = "cancel-in-flight.caf"
+        try writeChunkedSilentAudio(
+            to: AppPaths.assetURL(relativePath: relativePath),
+            duration: 180
+        )
+        var cue = RollCallTestFixtures.localCue(relativePath: relativePath)
+        cue.duration = 180
+        let clip = SongClip(cue: cue)
+        let expectedGeneratedURL = try generatedURL(for: clip)
+        let temporaryFilesBefore = try generatedTemporaryFiles()
+        let task = Task {
+            await SongClipGenerationService().prepare(clip)
+        }
+
+        let exportStarted = try await waitForNewGeneratedTemporaryFile(
+            excluding: temporaryFilesBefore,
+            timeout: .seconds(10)
+        )
+        XCTAssertTrue(exportStarted)
+
+        let cancellationStarted = ContinuousClock.now
+        task.cancel()
+        let outcome = await task.value
+        let cancellationDuration = cancellationStarted.duration(to: .now)
+
+        XCTAssertEqual(outcome, .failed(code: .renderFailed, retryable: true))
+        XCTAssertLessThan(cancellationDuration, .seconds(5))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: expectedGeneratedURL.path))
+        XCTAssertEqual(try generatedTemporaryFiles(), temporaryFilesBefore)
+    }
+
     func testReadableLocalSourceGeneratesPortableM4A() async throws {
         let relativePath = "source.caf"
         let sourceURL = try AppPaths.assetURL(relativePath: relativePath)
@@ -947,6 +1044,13 @@ final class SongClipGenerationTests: XCTestCase {
         let generatedRelativePath = try XCTUnwrap(asset.relativePath)
         let generatedURL = try AppPaths.assetURL(relativePath: generatedRelativePath)
         XCTAssertTrue(FileManager.default.fileExists(atPath: generatedURL.path))
+        XCTAssertEqual(generatedURL.pathExtension, "m4a")
+
+        let generatedAVAsset = AVURLAsset(url: generatedURL)
+        let generatedTracks = try await generatedAVAsset.loadTracks(withMediaType: .audio)
+        let generatedDuration = CMTimeGetSeconds(try await generatedAVAsset.load(.duration))
+        XCTAssertFalse(generatedTracks.isEmpty)
+        XCTAssertEqual(generatedDuration, 0.5, accuracy: 0.08)
     }
 
     func testWaveformSamplerReflectsReadableAudioAmplitude() async throws {
@@ -1193,6 +1297,58 @@ final class SongClipGenerationTests: XCTestCase {
         try file.write(from: buffer)
     }
 
+    private func writeChunkedSilentAudio(to url: URL, duration: TimeInterval) throws {
+        let format = try XCTUnwrap(
+            AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1)
+        )
+        let framesPerChunk = AVAudioFrameCount(format.sampleRate)
+        let buffer = try XCTUnwrap(
+            AVAudioPCMBuffer(pcmFormat: format, frameCapacity: framesPerChunk)
+        )
+        let file = try AVAudioFile(forWriting: url, settings: format.settings)
+        var remainingFrames = AVAudioFramePosition(duration * format.sampleRate)
+
+        while remainingFrames > 0 {
+            let frameCount = AVAudioFrameCount(
+                min(remainingFrames, AVAudioFramePosition(framesPerChunk))
+            )
+            buffer.frameLength = frameCount
+            try file.write(from: buffer)
+            remainingFrames -= AVAudioFramePosition(frameCount)
+        }
+    }
+
+    private func generatedURL(for clip: SongClip) throws -> URL {
+        try AppPaths.generatedClipsDirectory().appendingPathComponent(
+            "\(clip.id.uuidString.lowercased())-\(clip.generationKey.prefix(16)).m4a"
+        )
+    }
+
+    private func generatedTemporaryFiles() throws -> Set<String> {
+        Set(
+            try FileManager.default.contentsOfDirectory(
+                at: FileManager.default.temporaryDirectory,
+                includingPropertiesForKeys: nil
+            )
+            .map(\.lastPathComponent)
+            .filter { $0.hasPrefix("RollCallGenerated-") && $0.hasSuffix(".m4a") }
+        )
+    }
+
+    private func waitForNewGeneratedTemporaryFile(
+        excluding existingFiles: Set<String>,
+        timeout: Duration
+    ) async throws -> Bool {
+        let deadline = ContinuousClock.now + timeout
+        while ContinuousClock.now < deadline {
+            if try !generatedTemporaryFiles().subtracting(existingFiles).isEmpty {
+                return true
+            }
+            try await Task.sleep(for: .milliseconds(2))
+        }
+        return false
+    }
+
     private func writeSteppedAudio(to url: URL, duration: TimeInterval) throws {
         let format = try XCTUnwrap(
             AVAudioFormat(standardFormatWithSampleRate: 44_100, channels: 1)
@@ -1228,7 +1384,7 @@ final class SongClipGenerationTests: XCTestCase {
         id: UUID,
         matching predicate: (SongClip) -> Bool
     ) async throws -> SongClip {
-        for _ in 0..<100 {
+        for _ in 0..<4_800 {
             if let clip = model.selectedTeam?.teamClips.first(where: { $0.id == id }),
                predicate(clip) {
                 return clip
@@ -1247,7 +1403,7 @@ final class SongClipGenerationTests: XCTestCase {
         in model: AppModel,
         matching predicate: (SongClip) -> Bool
     ) async throws -> SongClip {
-        for _ in 0..<100 {
+        for _ in 0..<4_800 {
             if let clip = model.selectedTeam?.players.first?.songAssignment?.privateClip,
                predicate(clip) {
                 return clip

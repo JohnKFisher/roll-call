@@ -12,6 +12,7 @@ applicable third-party license.
 | Name | Version | Source | License | Attribution Requirement |
 | --- | --- | --- | --- | --- |
 | ZIPFoundation | 0.9.20 | https://github.com/weichsel/ZIPFoundation | MIT License | Include copyright/license acknowledgment for Thomas Zoechling and contributors |
+| TelemetryDeck Swift SDK | 2.14.2 | https://github.com/TelemetryDeck/SwiftSDK | MIT License | Include the TelemetryDeck copyright and MIT permission notice |
 
 ## Audio License Summary
 

@@ -1,6 +1,6 @@
 # Roll Call — Application Overview
 
-This document gives a non-code AI everything it needs to discuss the Roll Call app at a product level: what it is, who it's for, how the screens fit together, what the user can do on each one, and the principles that constrain future change. It is current as of build 80 / version 1.2.2.
+This document gives a non-code AI everything it needs to discuss the Roll Call app at a product level: what it is, who it's for, how the screens fit together, what the user can do on each one, and the principles that constrain future change. It is current as of build 111 / version 1.3.0 candidate.
 
 ---
 
@@ -36,6 +36,8 @@ These words have specific meaning in Roll Call. Use them precisely when discussi
 - **Announcer / Announcement Cue** — an optional recorded voice clip ("Now batting, number 17, Ellie!") that the user records into the app. Separate from the song cue. Lives at the player level.
 - **Lineup / Batting Order** — the ordered list of present players for today's game. Game Day plays in this order. The user can sort A-Z, sort by number, or drag manually. Manual order is preserved across launches.
 - **Game Day** — the live screen where the actual walkups happen. The product's reason for existing.
+- **Quick Game Day** — the zero-playback system entry that opens the existing Game Day screen for the team most recently used there, or an explicitly supplied Shortcut team. It is navigation, never a playback remote.
+- **Player Card** — an on-demand 4:5 share graphic centered on one player and their walk-up music. It is previewed and shared from Player Editor and is not a Game Day surface or stored gallery item.
 - **Game Day Announcer Mode** — how cues play. Three values: `Announcer Only`, `Announcer+Song`, `Song Only`. Set per-team in session state, toggled from the live screen.
 - **Sound Effect** — a bundled crowd reaction in the Clips tab, such as a small cheer, rhythmic clap, chant, or stadium swell.
 - **Custom Clip** — a team-specific live clip in the Clips tab. Custom Clips can be copied from Player Songs or created directly, then reordered, edited, deleted, restored, and exported with the team. After copying, Custom Clips and Player Songs are independent.
@@ -107,6 +109,8 @@ The center of the product. Dark by default in Live appearance (toggleable in Set
 
 Tap interactions degrade gracefully. If a player has no cue and announcer mode is "Song Only" or "Announcer+Song", playback falls back to a built-in cheer. If a player has no recorded announcer in "Announcer Only" mode, same. Game Day never fails silently and never errors out — it always plays *something*.
 
+Quick Game Day enters this same screen without playing anything. A normal request uses the team most recently entered intentionally in Game Day; merely viewing or editing another team does not change that target. If no remembered team exists, or it was deleted, Roll Call returns to its normal home/team-selection state rather than choosing a team arbitrarily. An App Intent can optionally receive an explicit team for advanced Shortcuts use. The iOS 18+ WidgetKit control is available to supported Control Center and Lock Screen surfaces; Shortcuts, Siri/Spotlight discovery, and Action Button use fall naturally out of the system intent/control architecture.
+
 ### 5.2 Clips (the live Clips tab)
 
 A team's live clip board, separate from the per-player walkup flow. This tab uses the same Live appearance treatment as Game Day so it can be used during a live moment without feeling like setup.
@@ -157,7 +161,9 @@ A scroll view of grouped sections:
 - **Setup Guide & Teams** — Open Setup Guide, plus a row that sends users to Teams for import/export tools.
 - **Support Roll Call** — opens the optional support screen with one-time and recurring StoreKit contribution options.
 - **Music & Playback** — Hide Explicit Apple Music Results, Volume Automation.
-- **Game Day** — Always Use Dark Live Screens, Game Day Haptics, Keep Screen Awake, Show Lineup Progress Hints.
+- **Privacy** — Anonymous Usage Analytics is on by default and can be disabled
+  independently of teams and app-state recovery; see [Privacy](./PRIVACY.md).
+- **Game Day** — permanent Quick Game Day explanation, Always Use Dark Live Screens, Game Day Haptics, Keep Screen Awake, Show Lineup Progress Hints.
 - **Recovery** — navigation into Recovery, where `Recently Deleted` handles everyday team/player undelete for 60 days and backups remain available for restoring an earlier app state.
 - **About Roll Call** — top doorway row into version, build, environment chip, copyright credit to John Kenneth Fisher, optional Support Roll Call entry, public web/GitHub-style link, Email Feedback link, What's New, earned Rate Roll Call entry, and Attributions & Licenses.
 - **Advanced / Developer Tools** (only visible when feature flag is on) — environment gates, runtime testing flags, experimental actions, diagnostics.
@@ -171,10 +177,11 @@ A scroll view of grouped sections:
 Opened from any player row (Players tab, Readiness list, Game Day tile long-press). The most feature-rich screen in the app. Sections, top to bottom:
 
 - **Setup Summary** — at-a-glance status card.
-- **Identity** — display name, uniform number, photo (PhotosPicker → in-app crop).
+- **Identity** — display name, uniform number, and photo. Selecting a new photo creates a metadata-stripped, bounded working master, then one on-device Vision pass suggests independent profile and Player Card framings. Normal selection completes without forcing crop editors; `Adjust Profile Photo` is an optional correction.
 - **Player Song** — choose from Music Library, search Apple Music, import audio or video, swap source, clear cue. Shows the assigned song title, source, and current readiness/portability status.
 - **Make Your Clip / Fine Tune Clip** (only when a song exists) — waveform or honest placeholder rail, selected-window dragging, length choices, exact start/length/fade controls, preview with playhead, and explicit Save for draft selections.
 - **Announcement Cue** — record a custom intro via in-app mic recording. Buttons: Start/Stop Recording, Preview, Clear. A warning is shown if the file reference exists but the audio file is missing.
+- **Player Card** — a visible `Preview & Share` action opens the finished Broadcast-style 1200-by-1500 graphic before the system Share Sheet. The preview also offers `Adjust Player Card Photo`; those draft framing changes follow the Player Editor's Save/Cancel transaction.
 - **Remove Player** at the bottom, destructive role.
 
 The editor is large and rich because per-player setup is where most setup time is spent. But the Setup Guide deliberately avoids most of this complexity — it only touches identity and song cue, leaving photos, announcer recordings, and advanced trim for later.
@@ -203,9 +210,9 @@ Reachable from Player Editor, Setup Guide audio, and Custom Clip editing. Provid
 
 Appears when the user imports a roster CSV. Lists the rows about to be imported. Confirm or cancel.
 
-### 6.6 Photo Crop full-screen cover
+### 6.6 Photo Framing full-screen cover
 
-Triggered after picking a player photo. Pan/zoom/rotate then save.
+Opened only when the user chooses to adjust either the profile or Player Card framing. Pan/zoom positioning is independently persisted for the chosen use. The original clean working master is not destructively replaced. VoiceOver users can adjust zoom and invoke named directional actions.
 
 ### 6.7 Support Roll Call screen
 
@@ -304,9 +311,11 @@ Discovery is preferred over pressure. Announcer intros are surfaced post-success
 
 ### `.rollcall` packages
 
-A `.rollcall` file is a portable archive of a single team: roster, Player Songs, Custom Clips, generated/local media when available, photos, custom announcer recordings, team identity, and session state. Created from Teams -> Share Team Package. Added via Teams -> Import Team Package, Settings -> Import or Export Teams, or by sending the file to the device (Files, AirDrop, etc.).
+A `.rollcall` file is a portable archive of a single team: roster, Player Songs, Custom Clips, generated/local media when available, photos, custom announcer recordings, team identity, and session state. For photos selected under the 1.3 model, it includes the compact profile rendition, clean working master, and both crop geometries; the export disclosure notes that the master can contain more of the scene. Created from Teams -> Share Team Package. Added via Teams -> Import Team Package, Settings -> Import or Export Teams, or by sending the file to the device (Files, AirDrop, etc.).
 
 Import adds the package as a new team and leaves existing teams unchanged. Imports automatically create a recovery backup first. Package preview and import should preserve unavailable items in place and report portability honestly: portable, ready on this device, needs Apple Music, still preparing, or needs repair.
+
+The 1.3 photo additions are additive under the existing package schema. A 1.2 importer can retain the profile rendition while ignoring the master and framing fields; exporting that downgraded team again loses those 1.3-only photo capabilities. Legacy cropped-only photos remain valid in 1.3 and become the best available source until the user selects a replacement.
 
 Support contribution state is not part of `.rollcall` packages. Team sharing should never carry purchase history, gratitude state, subscription status, or anything that suggests one user's support applies to another device/team owner.
 

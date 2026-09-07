@@ -493,15 +493,10 @@ struct PlayerSongsToCustomClipsResult: Equatable {
 
 @MainActor
 final class AppModel: ObservableObject {
-    private enum RatingRequestPolicy {
-        static let sessionThreshold = 10
-        static let retrySessionIncrement = 10
-        static let maxAutomaticPromptAttempts = 2
-        static let cooldown: TimeInterval = 4 * 60 * 60
-    }
-
     // Central default so a future settings UI can replace this with user selection.
     private let defaultNoSongFallbackBuiltInClipSourceID = "small-cheer"
+
+    let telemetry: RollCallTelemetryCoordinator
 
     @Published var state: AppState
     @Published private(set) var isBusy = false
@@ -536,6 +531,9 @@ final class AppModel: ObservableObject {
     private let riskyOperationCoordinator = RiskyOperationCoordinator()
     private let persistenceWriter = StatePersistenceWriter()
     private var persistSequence = 0
+    private var latestRequestedPersistenceSequence = 0
+    private var latestDurablePersistenceSequence = 0
+    private var statePersistenceFailureEpisodeActive = false
     private var readinessRefreshTask: Task<Void, Never>?
     private var audioRouteChangeTask: Task<Void, Never>?
     private var outputVolumeObservation: NSKeyValueObservation?
@@ -549,6 +547,7 @@ final class AppModel: ObservableObject {
     private var songClipPreparationLiveUseThrottled = false
     private var lowPowerModeTask: Task<Void, Never>?
     private var activePlaybackRequestID = UUID()
+    private var activePlaybackTelemetryContext: (engineRequestID: UUID, teamID: UUID, playerID: UUID, sourceFamily: PlaybackSourceFamily)?
     private var pendingAssetCleanupPaths = Set<String>()
     private let appleMusicPlaybackCapabilityResolver: () async -> AppleMusicPlaybackCapability
     private let catalogBackedResultResolver: (MusicSearchResult) async throws -> MusicSearchResult
@@ -582,19 +581,14 @@ final class AppModel: ObservableObject {
     }
 
     var hasEarnedRatingRequest: Bool {
-        state.ratingRequest.successfulGameDaySessionCount >= RatingRequestPolicy.sessionThreshold
+        telemetry.ratingSnapshot.probableGameDateCount >= 2
     }
 
-    var canPresentAutomaticRatingRequest: Bool {
-        state.ratingRequest.successfulGameDaySessionCount >= state.ratingRequest.nextAutomaticPromptSessionThreshold
-            && state.ratingRequest.automaticPromptAttemptCount < RatingRequestPolicy.maxAutomaticPromptAttempts
-    }
+    var canPresentAutomaticRatingRequest: Bool { telemetry.canPresentAutomaticRatingRequest }
 
     var ratingRequestDebugSummary: String {
-        let count = state.ratingRequest.successfulGameDaySessionCount
-        let nextThreshold = state.ratingRequest.nextAutomaticPromptSessionThreshold
-        let attempts = state.ratingRequest.automaticPromptAttemptCount
-        return "\(count) sessions, attempt \(attempts)/\(RatingRequestPolicy.maxAutomaticPromptAttempts), next auto at \(nextThreshold)"
+        let snapshot = telemetry.ratingSnapshot
+        return "\(snapshot.probableGameDateCount) probable-game dates, attempt \(snapshot.automaticAttemptsConsumed)/2"
     }
 
     init(
@@ -604,7 +598,8 @@ final class AppModel: ObservableObject {
         catalogBackedResultResolver: @escaping (MusicSearchResult) async throws -> MusicSearchResult = { result in
             try await MusicCatalogService().catalogBackedResult(for: result)
         },
-        previewPlaybackResolver: ((Cue) async throws -> Void)? = nil
+        previewPlaybackResolver: ((Cue) async throws -> Void)? = nil,
+        telemetry: RollCallTelemetryCoordinator? = nil
     ) {
         self.appleMusicPlaybackCapabilityResolver = appleMusicPlaybackCapabilityResolver
         self.catalogBackedResultResolver = catalogBackedResultResolver
@@ -619,6 +614,37 @@ final class AppModel: ObservableObject {
         self.readinessService = ReadinessService(audioAssetService: audioAssetService)
         let loadResult = Self.loadInitialState()
         self.state = loadResult.state
+        if let telemetry {
+            self.telemetry = telemetry
+        } else {
+            self.telemetry = Self.makeDefaultTelemetryCoordinator(
+                legacyAutomaticAttemptCount: loadResult.state.ratingRequest.automaticPromptAttemptCount
+            )
+        }
+        self.playbackEngine.onAsynchronousPlaybackResult = { [weak self] result in
+            guard let self,
+                  let context = self.activePlaybackTelemetryContext,
+                  result.requestID == context.engineRequestID,
+                  context.sourceFamily != .unknown else { return }
+            switch result.outcome {
+            case .started:
+                self.telemetry.handlePlaybackContinuation(
+                    teamID: context.teamID,
+                    confirmation: result,
+                    playbackMode: self.playbackMode(for: context.teamID)
+                )
+            case .failed(let reason):
+                self.telemetry.recordRecovery(
+                    teamID: context.teamID,
+                    failedComponent: result.component,
+                    sourceFamily: result.sourceFamily,
+                    recoveryOutcome: result.component == .announcement ? "songOnly" : "introOnly",
+                    reason: reason
+                )
+            case .cancelled:
+                break
+            }
+        }
         self.initialStateLoadWarning = loadResult.warning
         self.state.appVersion = AppMetadata.appVersion
         self.state.schemaVersion = max(self.state.schemaVersion, AppState.empty.schemaVersion)
@@ -631,17 +657,49 @@ final class AppModel: ObservableObject {
         FeatureFlags.assertReleaseSafety(featureFlags)
         normalizeSelectedTeamIfNeeded()
         normalizeAllTeams()
+        self.telemetry.validateLiveCheckpoint(
+            availableTeamIDs: Set(self.state.teams.map(\.id)),
+            selectedTeamID: self.state.selectedTeamID
+        )
         purgeExpiredRecentlyDeletedItems()
         reconcileOnboardingForExistingTeamIfNeeded()
+        self.telemetry.enroll(currentState: self.state)
+        if let recoveryReason = loadResult.recoveryReason {
+            self.telemetry.record(.stateRecoveryTriggered, properties: [.reason: recoveryReason])
+        }
         if let initialStateLoadWarning {
             lastError = initialStateLoadWarning
         }
         persist()
     }
 
+    private static func makeDefaultTelemetryCoordinator(legacyAutomaticAttemptCount: Int) -> RollCallTelemetryCoordinator {
+        let url = (try? AppPaths.telemetryStateURL())
+            ?? FileManager.default.temporaryDirectory.appendingPathComponent("rollcall-telemetry-state.json")
+        let store = TelemetryStore(
+            url: url,
+            legacyAutomaticAttemptCount: legacyAutomaticAttemptCount
+        )
+        let context = TelemetryBuildContext.current
+        #if canImport(TelemetryDeck)
+        let provider: RollCallTelemetryProvider
+        if context.isSwiftUIPreview {
+            provider = NullTelemetryProvider()
+        } else {
+            provider = TelemetryDeckProvider(
+                appID: Bundle.main.object(forInfoDictionaryKey: "TelemetryDeckAppID") as? String
+            )
+        }
+        #else
+        let provider: RollCallTelemetryProvider = NullTelemetryProvider()
+        #endif
+        return RollCallTelemetryCoordinator(provider: provider, store: store, buildContext: context)
+    }
+
     func finishLaunchingIfNeeded() async {
         guard !hasFinishedLaunching else { return }
         hasFinishedLaunching = true
+        telemetry.observeRetentionActivation(at: .now, wasAlreadyActive: false)
 
         let audioAssetService = self.audioAssetService
         let assetError = await Task.detached(priority: .utility) { () -> String? in
@@ -670,6 +728,11 @@ final class AppModel: ObservableObject {
         } catch {
             lastError = error.localizedDescription
         }
+    }
+
+    func handleTelemetryActivation(wasAlreadyActive: Bool) {
+        telemetry.observeRetentionActivation(at: .now, wasAlreadyActive: wasAlreadyActive)
+        telemetry.observeRatingEligibility(at: .now)
     }
 
     func handleIncomingPackage(_ url: URL) {
@@ -738,6 +801,7 @@ final class AppModel: ObservableObject {
         state.onboarding.didSeeLineup = false
         state.onboarding.importHandoffTeamID = nil
         persist()
+        telemetry.recordOnce(.onboardingStarted)
     }
 
     func startOnboardingReviewCurrentTeam() {
@@ -747,16 +811,19 @@ final class AppModel: ObservableObject {
         state.onboarding.didSeeLineup = false
         state.onboarding.importHandoffTeamID = nil
         persist()
+        telemetry.recordOnce(.onboardingStarted)
     }
 
     func completeOnboarding() {
         state.onboarding = .completed()
         persist()
+        telemetry.recordOnce(.onboardingCompleted)
     }
 
     func markOnboardingCheerFallbackChosen() {
         state.onboarding.didChooseCheerFallback = true
         persist()
+        telemetry.recordOnce(.onboardingCheerFallbackChosen)
     }
 
     func markOnboardingLineupSeen() {
@@ -765,9 +832,45 @@ final class AppModel: ObservableObject {
     }
 
     func selectTeam(_ team: Team) {
-        state.selectedTeamID = team.id
+        setSelectedTeamID(team.id)
         prewarmNextBatterCue()
         scheduleReadinessRefresh()
+        persist()
+    }
+
+    @discardableResult
+    func resolveOpenGameDay(_ request: OpenGameDayRequest) -> OpenGameDayResolution {
+        telemetry.record(.quickGameDayInvoked, properties: [.source: request.source.telemetryValue])
+        let resolution = OpenGameDayResolver.resolve(request, in: state)
+        switch resolution {
+        case .gameDay(let teamID, let targetKind):
+            if state.teams.contains(where: { $0.id == teamID }) {
+                setSelectedTeamID(teamID)
+                state.lastGameDayTeamID = teamID
+                prewarmNextBatterCue()
+                scheduleReadinessRefresh()
+                persist()
+                telemetry.record(.quickGameDayTargetResolved, properties: [.target: targetKind.rawValue])
+            }
+        case .fallback(let reason):
+            if reason == .rememberedTeamMissing {
+                state.lastGameDayTeamID = nil
+                persist()
+            }
+            telemetry.record(.quickGameDayFallback, properties: [.reason: reason.rawValue])
+        }
+        return resolution
+    }
+
+    func recordQuickGameDayReached() {
+        telemetry.record(.quickGameDayReached)
+    }
+
+    func recordIntentionalGameDayEntry() {
+        guard let teamID = state.selectedTeamID,
+              state.teams.contains(where: { $0.id == teamID }),
+              state.lastGameDayTeamID != teamID else { return }
+        state.lastGameDayTeamID = teamID
         persist()
     }
 
@@ -787,7 +890,7 @@ final class AppModel: ObservableObject {
             accentPreset: accentPreset
         )
         state.teams.append(team)
-        state.selectedTeamID = team.id
+        setSelectedTeamID(team.id)
         if forOnboarding {
             state.onboarding.activeFlow = state.teams.count == 1 ? .automatic : .manualCreate
             state.onboarding.activeTeamID = team.id
@@ -796,6 +899,7 @@ final class AppModel: ObservableObject {
             state.onboarding.importHandoffTeamID = nil
         }
         persist()
+        telemetry.recordRosterMilestones(for: state)
         return team
     }
 
@@ -829,9 +933,11 @@ final class AppModel: ObservableObject {
             battingOrderIsCustomized: team.session.battingOrderIsCustomized
         )
         state.teams.append(team)
-        state.selectedTeamID = team.id
+        setSelectedTeamID(team.id)
         normalizeLineup(for: state.teams.count - 1)
         persist()
+        telemetry.recordOnce(.teamDuplicated)
+        telemetry.recordRosterMilestones(for: state)
     }
 
     private func duplicatedSongAssignment(from assignment: SongAssignment?) -> SongAssignment? {
@@ -856,9 +962,13 @@ final class AppModel: ObservableObject {
 
     func setAccentPreset(_ accentPreset: TeamAccentPreset, for teamID: UUID) {
         guard let index = state.teams.firstIndex(where: { $0.id == teamID }) else { return }
+        let changed = state.teams[index].accentPreset != accentPreset
         state.teams[index].accentPreset = accentPreset
         state.teams[index].modifiedAt = .now
         persist()
+        if changed, accentPreset != .rollCallOrange {
+            telemetry.recordOnce(.teamAccentFirstChanged, properties: [.newAccent: accentPreset == .rollCallOrange ? "orange" : accentPreset.rawValue], teamID: teamID)
+        }
     }
 
     func removeSelectedTeam() {
@@ -871,6 +981,9 @@ final class AppModel: ObservableObject {
             )
         )
         state.teams.remove(at: teamIndex)
+        if state.lastGameDayTeamID == team.id {
+            state.lastGameDayTeamID = nil
+        }
         Task { await cancelSongClipPreparation(teamID: team.id) }
         normalizeSelectedTeamIfNeeded()
         stopPlayback()
@@ -890,6 +1003,7 @@ final class AppModel: ObservableObject {
         state.teams[teamIndex].modifiedAt = .now
         normalizeLineup(for: teamIndex)
         persist()
+        telemetry.recordRosterMilestones(for: state)
         return player
     }
 
@@ -897,6 +1011,11 @@ final class AppModel: ObservableObject {
         guard let teamIndex, let playerIndex = state.teams[teamIndex].players.firstIndex(where: { $0.id == player.id }) else { return }
         let previousPlayer = state.teams[teamIndex].players[playerIndex]
         let teamID = state.teams[teamIndex].id
+        let previousRepairCategories = repairCategories(for: previousPlayer, in: state.teams[teamIndex])
+        let repairAttemptedCategories = Set(
+            (previousPlayer.songAssignment != player.songAssignment ? ["playerMedia"] : [])
+                + (previousPlayer.customAnnouncerRelativePath != player.customAnnouncerRelativePath ? ["announcement"] : [])
+        )
         state.teams[teamIndex].players[playerIndex] = player
         state.teams[teamIndex].modifiedAt = .now
         normalizeLineup(for: teamIndex)
@@ -904,6 +1023,15 @@ final class AppModel: ObservableObject {
         prewarmNextBatterCue()
         scheduleReadinessRefresh()
         persist()
+        telemetry.recordPersonalizationChanges(from: previousPlayer, to: player, state: state)
+        telemetry.recordRosterMilestones(for: state)
+        for category in repairAttemptedCategories where previousRepairCategories.contains(category) {
+            telemetry.recordRepairNeeded(category: category)
+            telemetry.recordRepairAttempted(category: category)
+            if !repairCategories(for: player, in: state.teams[teamIndex]).contains(category) {
+                telemetry.recordRepairCompleted(category: category)
+            }
+        }
         if previousPlayer.songAssignment != player.songAssignment {
             Task { [weak self] in
                 guard let self else { return }
@@ -929,6 +1057,9 @@ final class AppModel: ObservableObject {
         merged.uniformNumber = draft.uniformNumber
         merged.pronunciationOverride = draft.pronunciationOverride
         merged.photoRelativePath = draft.photoRelativePath
+        merged.photoSourceRelativePath = draft.photoSourceRelativePath
+        merged.profilePhotoCrop = draft.profilePhotoCrop
+        merged.playerCardPhotoCrop = draft.playerCardPhotoCrop
 
         if let draftCue = draft.songAssignment?.privateClip?.editingCue,
            merged.songAssignment?.privateClip?.editingCue != draftCue {
@@ -958,6 +1089,7 @@ final class AppModel: ObservableObject {
         state.teams[teamIndex].teamClips.append(clip)
         state.teams[teamIndex].modifiedAt = .now
         persist()
+        telemetry.recordOnce(.clipsFirstCustomCreated)
         scheduleTeamClipPreparation(
             teamID: state.teams[teamIndex].id,
             teamClipID: clip.id,
@@ -972,6 +1104,11 @@ final class AppModel: ObservableObject {
             return
         }
         let previous = state.teams[teamIndex].teamClips[clipIndex]
+        let wasInRepair = !cueIsPlayable(previous.playbackCue)
+        if wasInRepair {
+            telemetry.recordRepairNeeded(category: "customClip")
+            telemetry.recordRepairAttempted(category: "customClip")
+        }
         let previousPaths = storedAssetRelativePaths(for: previous)
         var updated = SongClip(cue: cue)
         updated.id = clipID
@@ -999,6 +1136,9 @@ final class AppModel: ObservableObject {
             teamClipID: clipID,
             trigger: .assignmentSaved
         )
+        if wasInRepair, cueIsPlayable(updated.playbackCue) {
+            telemetry.recordRepairCompleted(category: "customClip")
+        }
     }
 
     func copyExistingClip(_ clip: SongClip, to playerID: UUID) {
@@ -1011,6 +1151,7 @@ final class AppModel: ObservableObject {
         prewarmNextBatterCue()
         scheduleReadinessRefresh()
         persist()
+        telemetry.recordOnce(.mediaClipReuseFirstUsed)
         scheduleSongClipPreparation(
             teamID: state.teams[teamIndex].id,
             playerID: playerID,
@@ -1036,6 +1177,7 @@ final class AppModel: ObservableObject {
         state.teams[teamIndex].players[playerIndex].songAssignment = .privateClip(copy)
         state.teams[teamIndex].modifiedAt = .now
         persist()
+        telemetry.recordOnce(.mediaClipReuseFirstUsed)
         scheduleSongClipPreparation(
             teamID: state.teams[teamIndex].id,
             playerID: playerID,
@@ -1061,6 +1203,7 @@ final class AppModel: ObservableObject {
         state.teams[teamIndex].teamClips.append(copy)
         state.teams[teamIndex].modifiedAt = .now
         persist()
+        telemetry.recordOnce(.clipsFirstCustomCreated)
         scheduleTeamClipPreparation(
             teamID: state.teams[teamIndex].id,
             teamClipID: copy.id,
@@ -1185,18 +1328,21 @@ final class AppModel: ObservableObject {
         updatePlayer(updated)
     }
 
-    func setPresent(_ player: Player, isPresent: Bool) {
+    func setPresent(_ player: Player, isPresent: Bool, recordLiveActivity: Bool = false) {
         guard player.isPresent != isPresent else { return }
         var updated = player
         updated.isPresent = isPresent
         updatePlayer(updated)
+        if recordLiveActivity, let teamIndex {
+            telemetry.handleLineupActivity(teamID: state.teams[teamIndex].id, edited: true)
+        }
     }
 
     func refreshGameDayWarmup() {
         prewarmNextBatterCue()
     }
 
-    func movePlayers(from offsets: IndexSet, to offset: Int) {
+    func movePlayers(from offsets: IndexSet, to offset: Int, recordLiveActivity: Bool = false) {
         guard let teamIndex else { return }
         state.teams[teamIndex].players.move(fromOffsets: offsets, toOffset: offset)
         state.teams[teamIndex].session.battingOrder = state.teams[teamIndex].players.map(\.id)
@@ -1204,33 +1350,45 @@ final class AppModel: ObservableObject {
         normalizeLineup(for: teamIndex)
         prewarmNextBatterCue()
         persist()
+        if recordLiveActivity {
+            telemetry.handleLineupActivity(teamID: state.teams[teamIndex].id, edited: true)
+        }
     }
 
-    func moveBattingOrder(from offsets: IndexSet, to offset: Int) {
+    func moveBattingOrder(from offsets: IndexSet, to offset: Int, recordLiveActivity: Bool = false) {
         guard let teamIndex else { return }
         state.teams[teamIndex].session.battingOrder.move(fromOffsets: offsets, toOffset: offset)
         state.teams[teamIndex].session.battingOrderIsCustomized = true
         normalizeLineup(for: teamIndex)
         prewarmNextBatterCue()
         persist()
+        if recordLiveActivity {
+            telemetry.handleLineupActivity(teamID: state.teams[teamIndex].id, edited: true)
+        }
     }
 
-    func sortBattingOrderAlphabetically() {
+    func sortBattingOrderAlphabetically(recordLiveActivity: Bool = false) {
         guard let teamIndex else { return }
         state.teams[teamIndex].session.battingOrder = alphabeticalBattingOrder(for: state.teams[teamIndex].players)
         state.teams[teamIndex].session.battingOrderIsCustomized = true
         normalizeLineup(for: teamIndex)
         prewarmNextBatterCue()
         persist()
+        if recordLiveActivity {
+            telemetry.handleLineupActivity(teamID: state.teams[teamIndex].id, edited: true)
+        }
     }
 
-    func sortBattingOrderByNumber() {
+    func sortBattingOrderByNumber(recordLiveActivity: Bool = false) {
         guard let teamIndex else { return }
         state.teams[teamIndex].session.battingOrder = uniformNumberBattingOrder(for: state.teams[teamIndex].players)
         state.teams[teamIndex].session.battingOrderIsCustomized = true
         normalizeLineup(for: teamIndex)
         prewarmNextBatterCue()
         persist()
+        if recordLiveActivity {
+            telemetry.handleLineupActivity(teamID: state.teams[teamIndex].id, edited: true)
+        }
     }
 
     @discardableResult
@@ -1298,6 +1456,8 @@ final class AppModel: ObservableObject {
             var updated = player
             updated.cue = .localDefault(source: source)
             self.updatePlayer(updated)
+            let videoExtensions = ["mov", "mp4", "m4v", "avi", "mkv"]
+            self.telemetry.recordOnce(videoExtensions.contains(url.pathExtension.lowercased()) ? .mediaImportFirstVideo : .mediaImportFirstAudio)
         }
     }
 
@@ -1309,6 +1469,9 @@ final class AppModel: ObservableObject {
             customAnnouncerRecordingPhase = .recording(playerID)
         } catch {
             customAnnouncerRecordingPhase = .idle
+            if let appError = error as? AppError, case .microphonePermissionDenied = appError {
+                telemetry.recordOnce(.microphoneAccessDenied, properties: [.result: "denied"])
+            }
             lastError = error.localizedDescription
         }
     }
@@ -1399,49 +1562,116 @@ final class AppModel: ObservableObject {
             guard let selectedPlayer = selectedTeam?.players.first(where: { $0.id == player.id }) else { return }
             currentPlayer = selectedPlayer
         }
+        let selectedTeamID = state.selectedTeamID ?? teamID
         var attemptedPlan: PlayerPlaybackPlan?
         do {
             guard let plan = playbackPlan(for: currentPlayer) else { return }
             attemptedPlan = plan
+            let result: PlaybackRequestResult
             switch plan {
-            case .cue(let cue, let announcerRelativePath):
-                try await playbackEngine.play(
+            case .cue(let cue, let announcerRelativePath, let sourceFamily):
+                result = try await playbackEngine.play(
                     cue: cue,
                     announcerRelativePath: announcerRelativePath,
-                    fadeOutVolumeAutomationEnabled: state.settings.fadeOutVolumeAutomationEnabled
+                    fadeOutVolumeAutomationEnabled: state.settings.fadeOutVolumeAutomationEnabled,
+                    sourceFamilyOverride: sourceFamily
                 )
             case .assetOnly(let relativePath, let activeCueID):
-                try await playbackEngine.playAsset(
+                result = try await playbackEngine.playAsset(
                     relativePath: relativePath,
                     activeCueID: activeCueID,
                     fadeOutVolumeAutomationEnabled: state.settings.fadeOutVolumeAutomationEnabled
                 )
             }
             guard isCurrentPlaybackRequest(requestID) else { return }
-            markGameDayPlayerCuePlayedForRating()
+            guard result.hasStartedComponent else { return }
+            if let selectedTeamID {
+                if let started = result.confirmations.first(where: {
+                    if case .started = $0.outcome { return true }; return false
+                }) {
+                    activePlaybackTelemetryContext = (result.requestID, selectedTeamID, currentPlayer.id, started.sourceFamily)
+                }
+                telemetry.beginLiveSessionIfNeeded(teamID: selectedTeamID)
+                telemetry.handlePlayerPlayback(
+                    teamID: selectedTeamID,
+                    playerID: currentPlayer.id,
+                    result: result,
+                    gameProperties: gameProperties(for: selectedTeamID),
+                    playbackMode: playbackMode(for: selectedTeamID)
+                )
+                recordRecoveries(in: result, teamID: selectedTeamID)
+            }
             haptics.success(isEnabled: state.settings.hapticsEnabled)
         } catch {
             guard isCurrentPlaybackRequest(requestID) else { return }
-            if case .cue(let failedCue, _)? = attemptedPlan,
-               let fallbackCue = fallbackCueAfterPlaybackFailure(for: currentPlayer, failedCue: failedCue) {
+            if let attemptedPlan,
+               let fallbackCue = fallbackCueAfterPlaybackFailure(for: currentPlayer, plan: attemptedPlan) {
                 activeFallbackPlayerID = currentPlayer.id
                 do {
-                    try await playbackEngine.play(
+                    let fallbackResult = try await playbackEngine.play(
                         cue: fallbackCue,
                         announcerRelativePath: nil,
                         fadeOutVolumeAutomationEnabled: state.settings.fadeOutVolumeAutomationEnabled
                     )
                     guard isCurrentPlaybackRequest(requestID) else { return }
-                    markGameDayPlayerCuePlayedForRating()
+                    guard fallbackResult.hasStartedComponent else { return }
+                    if let selectedTeamID {
+                        if let started = fallbackResult.confirmations.first(where: {
+                            if case .started = $0.outcome { return true }; return false
+                        }) {
+                            activePlaybackTelemetryContext = (fallbackResult.requestID, selectedTeamID, currentPlayer.id, started.sourceFamily)
+                        }
+                        telemetry.beginLiveSessionIfNeeded(teamID: selectedTeamID)
+                        telemetry.handlePlayerPlayback(
+                            teamID: selectedTeamID,
+                            playerID: currentPlayer.id,
+                            result: fallbackResult,
+                            gameProperties: gameProperties(for: selectedTeamID),
+                            playbackMode: playbackMode(for: selectedTeamID)
+                        )
+                        recordRecoveries(in: fallbackResult, teamID: selectedTeamID)
+                        let failedComponent: PlaybackComponent = {
+                            if case .assetOnly = attemptedPlan { return .announcement }
+                            return .primaryCue
+                        }()
+                        telemetry.recordRecovery(
+                            teamID: selectedTeamID,
+                            failedComponent: failedComponent,
+                            sourceFamily: failureSourceFamily(for: attemptedPlan),
+                            recoveryOutcome: {
+                                if case .builtInClip = fallbackCue.source { return "builtinCheer" }
+                                return "songOnly"
+                            }(),
+                            reason: playbackEngine.playbackFailureReason(for: error)
+                        )
+                    }
                     haptics.success(isEnabled: state.settings.hapticsEnabled)
                     return
                 } catch {
                     guard isCurrentPlaybackRequest(requestID) else { return }
+                    if let selectedTeamID {
+                        telemetry.recordPlaybackFailure(
+                            teamID: selectedTeamID,
+                            sourceFamily: failureSourceFamily(for: attemptedPlan),
+                            liveContext: "gameDay",
+                            fallbackAttempted: true,
+                            reason: playbackEngine.playbackFailureReason(for: error)
+                        )
+                    }
                     activeFallbackPlayerID = nil
                     lastError = error.localizedDescription
                     haptics.warning(isEnabled: state.settings.hapticsEnabled)
                     return
                 }
+            }
+            if let selectedTeamID {
+                telemetry.recordPlaybackFailure(
+                    teamID: selectedTeamID,
+                    sourceFamily: attemptedPlan.map(failureSourceFamily(for:)) ?? .unknown,
+                    liveContext: "gameDay",
+                    fallbackAttempted: false,
+                    reason: playbackEngine.playbackFailureReason(for: error)
+                )
             }
             lastError = error.localizedDescription
             haptics.warning(isEnabled: state.settings.hapticsEnabled)
@@ -1451,14 +1681,25 @@ final class AppModel: ObservableObject {
     func play(builtInClip: BuiltInClip) async {
         let requestID = beginPlaybackRequest()
         do {
-            try await playbackEngine.play(
+            let result = try await playbackEngine.play(
                 cue: builtInClip.cue,
                 fadeOutVolumeAutomationEnabled: state.settings.fadeOutVolumeAutomationEnabled
             )
             guard isCurrentPlaybackRequest(requestID) else { return }
+            if result.hasStartedComponent, let teamID = state.selectedTeamID {
+                telemetry.beginLiveSessionIfNeeded(teamID: teamID)
+                telemetry.handleClipPlayback(teamID: teamID, isCustom: false)
+            }
             haptics.success(isEnabled: state.settings.hapticsEnabled)
         } catch {
             guard isCurrentPlaybackRequest(requestID) else { return }
+            telemetry.recordPlaybackFailure(
+                teamID: state.selectedTeamID,
+                sourceFamily: .builtin,
+                liveContext: "clips",
+                fallbackAttempted: false,
+                reason: playbackEngine.playbackFailureReason(for: error)
+            )
             lastError = error.localizedDescription
             haptics.warning(isEnabled: state.settings.hapticsEnabled)
         }
@@ -1469,21 +1710,37 @@ final class AppModel: ObservableObject {
         let currentClip = selectedTeam?.teamClips.first(where: { $0.id == customClip.id }) ?? customClip
         let cue = currentClip.playbackCue
         guard cueIsPlayable(cue) else {
+            telemetry.recordRepairNeeded(category: "customClip")
             lastError = currentClip.readinessInputs.playback == .needsAppleMusic
                 ? "This Custom Clip needs Apple Music access on this device."
                 : "This Custom Clip needs repair before it can play."
             haptics.warning(isEnabled: state.settings.hapticsEnabled)
             return
         }
+        let sourceFamily = currentClip.hasCurrentGeneratedAsset
+            ? PlaybackSourceFamily.generatedLocal
+            : playbackSourceFamily(for: cue)
         do {
-            try await playbackEngine.play(
+            let result = try await playbackEngine.play(
                 cue: cue,
-                fadeOutVolumeAutomationEnabled: state.settings.fadeOutVolumeAutomationEnabled
+                fadeOutVolumeAutomationEnabled: state.settings.fadeOutVolumeAutomationEnabled,
+                sourceFamilyOverride: sourceFamily
             )
             guard isCurrentPlaybackRequest(requestID) else { return }
+            if result.hasStartedComponent, let teamID = state.selectedTeamID {
+                telemetry.beginLiveSessionIfNeeded(teamID: teamID)
+                telemetry.handleClipPlayback(teamID: teamID, isCustom: true)
+            }
             haptics.success(isEnabled: state.settings.hapticsEnabled)
         } catch {
             guard isCurrentPlaybackRequest(requestID) else { return }
+            telemetry.recordPlaybackFailure(
+                teamID: state.selectedTeamID,
+                sourceFamily: sourceFamily,
+                liveContext: "clips",
+                fallbackAttempted: false,
+                reason: playbackEngine.playbackFailureReason(for: error)
+            )
             lastError = error.localizedDescription
             haptics.warning(isEnabled: state.settings.hapticsEnabled)
         }
@@ -1501,12 +1758,34 @@ final class AppModel: ObservableObject {
     private func beginPlaybackRequest() -> UUID {
         let requestID = UUID()
         activePlaybackRequestID = requestID
+        activePlaybackTelemetryContext = nil
         activeFallbackPlayerID = nil
         return requestID
     }
 
     private func isCurrentPlaybackRequest(_ requestID: UUID) -> Bool {
         activePlaybackRequestID == requestID
+    }
+
+    private func recordRecoveries(in result: PlaybackRequestResult, teamID: UUID) {
+        guard result.confirmations.contains(where: {
+            if case .started = $0.outcome { return true }; return false
+        }) else { return }
+        for confirmation in result.confirmations {
+            guard case .failed(let reason) = confirmation.outcome else { continue }
+            let outcome: String
+            switch confirmation.component {
+            case .announcement: outcome = "songOnly"
+            case .primaryCue: outcome = "introOnly"
+            }
+            telemetry.recordRecovery(
+                teamID: teamID,
+                failedComponent: confirmation.component,
+                sourceFamily: confirmation.sourceFamily,
+                recoveryOutcome: outcome,
+                reason: reason
+            )
+        }
     }
 
     func previewCue(_ cue: Cue) async {
@@ -1804,6 +2083,7 @@ final class AppModel: ObservableObject {
         haptics.success(isEnabled: state.settings.hapticsEnabled)
         prewarmNextBatterCue()
         persist()
+        telemetry.handleLineupActivity(teamID: state.teams[teamIndex].id)
     }
 
     func goToPreviousBatter() {
@@ -1819,6 +2099,7 @@ final class AppModel: ObservableObject {
         haptics.success(isEnabled: state.settings.hapticsEnabled)
         prewarmNextBatterCue()
         persist()
+        telemetry.handleLineupActivity(teamID: state.teams[teamIndex].id)
     }
 
     func setHapticsEnabled(_ isEnabled: Bool) {
@@ -1827,18 +2108,24 @@ final class AppModel: ObservableObject {
     }
 
     func setFadeOutVolumeAutomationEnabled(_ isEnabled: Bool) {
+        let changed = state.settings.fadeOutVolumeAutomationEnabled != isEnabled
         state.settings.fadeOutVolumeAutomationEnabled = isEnabled
         persist()
+        if changed { telemetry.recordOnce(.settingVolumeAutomationFirstChanged, properties: [.newValue: isEnabled ? "on" : "off"]) }
     }
 
     func setAlwaysUseDarkLiveMode(_ isEnabled: Bool) {
+        let changed = state.settings.alwaysUseDarkLiveMode != isEnabled
         state.settings.alwaysUseDarkLiveMode = isEnabled
         persist()
+        if changed { telemetry.recordOnce(.settingDarkLiveScreensFirstChanged, properties: [.newValue: isEnabled ? "on" : "off"]) }
     }
 
     func setKeepScreenAwakeDuringLiveUse(_ isEnabled: Bool) {
+        let changed = state.settings.keepScreenAwakeDuringLiveUse != isEnabled
         state.settings.keepScreenAwakeDuringLiveUse = isEnabled
         persist()
+        if changed { telemetry.recordOnce(.settingKeepScreenAwakeFirstChanged, properties: [.newValue: isEnabled ? "on" : "off"]) }
     }
 
     func setShowLineupProgressHints(_ isEnabled: Bool) {
@@ -1847,8 +2134,16 @@ final class AppModel: ObservableObject {
     }
 
     func setExplicitAppleMusicSearchFilteringEnabled(_ isEnabled: Bool) {
+        let changed = state.settings.explicitAppleMusicSearchFilteringEnabled != isEnabled
         state.settings.explicitAppleMusicSearchFilteringEnabled = isEnabled
         persist()
+        if changed { telemetry.recordOnce(.settingExplicitFilterFirstChanged, properties: [.newValue: isEnabled ? "on" : "off"]) }
+    }
+
+    var anonymousUsageAnalyticsEnabled: Bool { telemetry.analyticsEnabled }
+
+    func setAnonymousUsageAnalyticsEnabled(_ isEnabled: Bool) {
+        telemetry.setAnalyticsEnabled(isEnabled)
     }
 
     func setSongClipPreparationLiveUseThrottled(_ throttled: Bool) {
@@ -1903,57 +2198,74 @@ final class AppModel: ObservableObject {
     }
 
     func beginGameDayVisitForRatingIfNeeded() {
-        guard state.ratingRequest.hasPlayedQualifyingCueInCurrentGameDayVisit
-                || state.ratingRequest.hasCountedCurrentGameDayVisit else { return }
-        state.ratingRequest.hasPlayedQualifyingCueInCurrentGameDayVisit = false
-        state.ratingRequest.hasCountedCurrentGameDayVisit = false
-        persist()
+        // Retained as a source-compatible no-op for older callers. Rating
+        // policy is now driven by the telemetry store's probable-game state.
     }
 
     func finalizeGameDayVisitForRatingIfNeeded(at date: Date = .now) {
-        guard state.ratingRequest.hasPlayedQualifyingCueInCurrentGameDayVisit,
-              !state.ratingRequest.hasCountedCurrentGameDayVisit else { return }
-
-        if shouldCountSuccessfulGameDaySession(at: date) {
-            state.ratingRequest.successfulGameDaySessionCount += 1
-            state.ratingRequest.lastCountedSuccessfulGameDaySessionAt = date
-        }
-        state.ratingRequest.hasCountedCurrentGameDayVisit = true
-        persist()
+        // Retained as a source-compatible no-op. Leaving Game Day is not a
+        // qualifying telemetry or rating event.
     }
 
     func markAutomaticRatingPromptAttempted() {
-        guard state.ratingRequest.automaticPromptAttemptCount < RatingRequestPolicy.maxAutomaticPromptAttempts else { return }
-        state.ratingRequest.automaticPromptAttemptCount += 1
-        if state.ratingRequest.automaticPromptAttemptCount < RatingRequestPolicy.maxAutomaticPromptAttempts {
-            state.ratingRequest.nextAutomaticPromptSessionThreshold += RatingRequestPolicy.retrySessionIncrement
-        }
-        persist()
+        // Automatic attempts are consumed only by the confirmed appearance
+        // callback. This old method intentionally cannot consume one.
     }
 
     func setRatingThresholdMetForTesting(_ isMet: Bool) {
-        state.ratingRequest.successfulGameDaySessionCount = isMet ? RatingRequestPolicy.sessionThreshold : 0
-        state.ratingRequest.hasPlayedQualifyingCueInCurrentGameDayVisit = false
-        state.ratingRequest.hasCountedCurrentGameDayVisit = false
-        state.ratingRequest.lastCountedSuccessfulGameDaySessionAt = nil
-        state.ratingRequest.automaticPromptAttemptCount = 0
-        state.ratingRequest.nextAutomaticPromptSessionThreshold = RatingRequestPolicy.sessionThreshold
-        persist()
+        var candidate = telemetry.store.state
+        candidate.rating.enrollmentDate = isMet ? Date().addingTimeInterval(-7 * 86_400) : Date()
+        candidate.rating.distinctProbableGameDates = isMet
+            ? [candidate.rating.enrollmentDate, candidate.rating.enrollmentDate.addingTimeInterval(86_400)]
+            : []
+        candidate.rating.probableGameDateKeys = isMet
+            ? RollCallRatingPolicy.distinctLocalDates(candidate.rating.distinctProbableGameDates).map { RollCallRatingPolicy.localDateKey(for: $0) }
+            : []
+        candidate.rating.automaticAttemptsConsumed = 0
+        candidate.rating.firstSheetShownAt = nil
+        candidate.rating.presentationCooldownAnchor = nil
+        candidate.rating.permanentlySuppressed = false
+        candidate.rating.eligibilityEmittedForAttempts = []
+        _ = telemetry.store.save(candidate)
     }
 
     private func normalizeRatingRequestPolicyState() {
-        let attemptCount = max(0, min(state.ratingRequest.automaticPromptAttemptCount, RatingRequestPolicy.maxAutomaticPromptAttempts))
-        let retrySteps = min(attemptCount, RatingRequestPolicy.maxAutomaticPromptAttempts - 1)
-        state.ratingRequest.nextAutomaticPromptSessionThreshold = RatingRequestPolicy.sessionThreshold
-            + (retrySteps * RatingRequestPolicy.retrySessionIncrement)
+        // The legacy AppState fields remain decodable for migration only. New
+        // policy state is never normalized back into AppState.
+    }
+
+    func reserveAutomaticRatingPresentation() -> UUID? {
+        telemetry.reserveRatingPresentation(source: .automatic)
+    }
+
+    func reserveManualRatingPresentation() -> UUID? {
+        telemetry.reserveRatingPresentation(source: .manual)
+    }
+
+    func confirmRatingSheetAppeared(token: UUID, source: PendingRatingPresentation.Source) {
+        _ = source
+        telemetry.confirmRatingPresentation(token: token)
+    }
+
+    func cancelRatingSheetBeforeAppearance(token: UUID? = nil) {
+        telemetry.cancelRatingPresentationBeforeAppearance(token: token)
+    }
+
+    func recordRatingAction(_ event: RollCallTelemetryEvent, suppressesAutomatic: Bool) {
+        telemetry.recordRatingAction(event, suppressesAutomatic: suppressesAutomatic)
     }
 
     func setGameDayAnnouncerMode(_ mode: GameDayAnnouncerMode) {
         guard let teamIndex else { return }
+        let teamID = state.teams[teamIndex].id
+        let changed = state.teams[teamIndex].session.gameDayAnnouncerMode != mode
         state.teams[teamIndex].session.gameDayAnnouncerMode = mode
         state.teams[teamIndex].modifiedAt = .now
         scheduleReadinessRefresh()
         persist()
+        if changed, mode != .announcerAndSong {
+            telemetry.recordOnce(.announcerModeFirstChanged, properties: [.newMode: mode.rawValue], teamID: teamID)
+        }
     }
 
     func saveSelectedTeamAnnouncerProfile(_ profile: TeamAnnouncerProfile) {
@@ -1966,16 +2278,7 @@ final class AppModel: ObservableObject {
     }
 
     private func markGameDayPlayerCuePlayedForRating() {
-        guard !state.ratingRequest.hasPlayedQualifyingCueInCurrentGameDayVisit else { return }
-        state.ratingRequest.hasPlayedQualifyingCueInCurrentGameDayVisit = true
-        persist()
-    }
-
-    private func shouldCountSuccessfulGameDaySession(at date: Date) -> Bool {
-        guard let lastCountedAt = state.ratingRequest.lastCountedSuccessfulGameDaySessionAt else {
-            return true
-        }
-        return date.timeIntervalSince(lastCountedAt) >= RatingRequestPolicy.cooldown
+        // Rating eligibility is updated by confirmed structured playback.
     }
 
     func selectedTeamAppleMusicPlaylistSummary() -> TeamAppleMusicPlaylistSummary? {
@@ -2052,6 +2355,9 @@ final class AppModel: ObservableObject {
                 message += " Added \(duplicateCount == 1 ? "1 duplicate song" : "\(duplicateCount) duplicate songs") once."
             }
             appleMusicPlaylistSyncStatus = message
+            if let teamID = state.selectedTeamID {
+                telemetry.recordPlaylistSyncSuccess(teamID: teamID)
+            }
             haptics.success(isEnabled: state.settings.hapticsEnabled)
         } catch {
             appleMusicPlaylistSyncStatus = error.localizedDescription
@@ -2147,7 +2453,7 @@ final class AppModel: ObservableObject {
             imported.name += " Imported"
             let originalImportedTeamID = importResult.manifest.team.id
             self.state.teams.append(imported)
-            self.state.selectedTeamID = imported.id
+            self.setSelectedTeamID(imported.id)
             self.normalizeLineup(for: self.state.teams.count - 1)
             if opensOnboardingHandoff {
                 self.state.onboarding = OnboardingState(
@@ -2166,6 +2472,15 @@ final class AppModel: ObservableObject {
                 teamName: imported.name
             )
             self.persist()
+            let hadMissingMedia = importResult.audit.summary.hasDeviceDependentClips || importResult.audit.summary.hasUnresolvedClips
+            self.telemetry.recordPackageImportCompleted(hadMissingMedia: hadMissingMedia)
+            if hadMissingMedia {
+                self.telemetry.recordRepairNeeded(category: "importedPackageMedia")
+            }
+            self.telemetry.recordRosterMilestones(for: self.state)
+            if opensOnboardingHandoff {
+                self.telemetry.recordOnce(.onboardingImportPathUsed)
+            }
             for teamClip in imported.teamClips {
                 self.scheduleTeamClipPreparation(
                     teamID: imported.id,
@@ -2220,6 +2535,7 @@ final class AppModel: ObservableObject {
             guard let teamIndex = self.state.teams.firstIndex(where: { $0.id == targetTeamID }) else {
                 throw AppError.noSelectedTeam
             }
+            let importedRowCount = pendingRosterImport.rows.count
             try await self.createBackupBeforeRiskyOperation(reason: "Automatic backup before roster CSV import")
             self.state.teams[teamIndex].players.append(contentsOf: pendingRosterImport.rows)
             self.state.teams[teamIndex].session.battingOrder.append(contentsOf: pendingRosterImport.rows.map(\.id))
@@ -2228,6 +2544,16 @@ final class AppModel: ObservableObject {
             self.pendingRosterImport = nil
             self.prewarmNextBatterCue()
             self.scheduleReadinessRefresh()
+            self.persist()
+            self.telemetry.recordRosterMilestones(for: self.state)
+            let bucket: String
+            switch importedRowCount {
+            case 1...5: bucket = "1-5"
+            case 6...10: bucket = "6-10"
+            case 11...20: bucket = "11-20"
+            default: bucket = "21+"
+            }
+            self.telemetry.recordOnce(.csvImportFirstUsed, properties: [.rowCountBucket: bucket])
         }
     }
 
@@ -2239,16 +2565,61 @@ final class AppModel: ObservableObject {
         state.lastReadiness = readinessService.snapshot(for: selectedTeam)
     }
 
+    func recordReadinessOpened() {
+        telemetry.recordOnce(.readinessFirstOpened)
+        guard let checks = selectedTeamReadiness?.checks else { return }
+        for check in checks where check.state == .issue {
+            switch check.category {
+            case .playerAudio:
+                telemetry.recordRepairNeeded(category: "playerMedia")
+            case .playerAnnouncement:
+                telemetry.recordRepairNeeded(category: "announcement")
+            case .appleMusicAccess:
+                telemetry.recordRepairNeeded(category: "appleMusicAccess")
+            case .audioRoute, .volume, .network, .lineup, .playerPhoto:
+                break
+            }
+        }
+    }
+
+    private func repairCategories(for player: Player, in team: Team) -> Set<String> {
+        var categories = Set<String>()
+        let checks = readinessService.snapshot(for: team).checks
+        for check in checks where check.playerID == player.id && check.state == .issue {
+            switch check.category {
+            case .playerAudio:
+                categories.insert("playerMedia")
+            case .playerAnnouncement:
+                categories.insert("announcement")
+            case .appleMusicAccess, .playerPhoto, .audioRoute, .volume, .network, .lineup:
+                break
+            }
+        }
+        return categories
+    }
+
     var needsAppleMusicAccessPrompt: Bool {
         MusicAuthorization.currentStatus == .notDetermined
     }
 
     @discardableResult
     func requestAppleMusicAccess() async -> MusicAuthorization.Status {
+        if selectedTeamReadiness?.checks.contains(where: { $0.category == .appleMusicAccess && $0.state == .issue }) == true {
+            telemetry.recordRepairNeeded(category: "appleMusicAccess")
+            telemetry.recordRepairAttempted(category: "appleMusicAccess")
+        }
         let status = await MusicAuthorization.request()
         await refreshAppleMusicPlaybackCapability()
         refreshReadiness()
         scheduleAllSongClipPreparation(trigger: .authorizationChanged)
+        switch status {
+        case .denied, .restricted:
+            telemetry.recordOnce(.musicAccessDenied, properties: [.result: status == .denied ? "denied" : "restricted"])
+        case .authorized:
+            telemetry.recordRepairCompleted(category: "appleMusicAccess")
+        default:
+            break
+        }
         return status
     }
 
@@ -2286,6 +2657,7 @@ final class AppModel: ObservableObject {
             do {
                 try await self.createBackupAndWait(reason: reason)
             } catch {
+                self.telemetry.record(.backupFailed)
                 self.lastError = error.localizedDescription
             }
         }
@@ -2296,6 +2668,9 @@ final class AppModel: ObservableObject {
         let snapshotRecord = try await writeBackupRecord(for: snapshotState, reason: reason).get()
         insertBackupRecord(snapshotRecord)
         persist()
+        if reason == "Manual backup" {
+            telemetry.recordOnce(.backupManualCreated)
+        }
     }
 
     private func createBackupBeforeRiskyOperation(reason: String) async throws {
@@ -2388,11 +2763,14 @@ final class AppModel: ObservableObject {
             }.value
 
             self.state = restoredState
+            self.telemetry.handleTeamBoundaryChange()
             self.insertBackupRecord(preRestoreBackup)
             self.normalizeSelectedTeamIfNeeded()
             self.normalizeAllTeams()
             self.scheduleReadinessRefresh()
             self.persist()
+            self.telemetry.recordOnce(.backupRestored)
+            self.telemetry.recordRosterMilestones(for: self.state)
         }
     }
 
@@ -2459,6 +2837,7 @@ final class AppModel: ObservableObject {
             }
             restoreDeletedCustomClip(item, deletedClip: deletedClip, isMissingMedia: isMissingMedia)
         }
+        telemetry.recordOnce(.recentlyDeletedRestored)
     }
 
     func permanentlyDeleteRecentlyDeletedItem(_ item: RecentlyDeletedItem) {
@@ -2577,7 +2956,7 @@ final class AppModel: ObservableObject {
     }
 
     private func playableCueForPlayerPlayback(_ player: Player) -> Cue? {
-        if let cue = resolvedCue(for: player), cueIsPlayable(cue) {
+        if let cue = resolvedCue(for: player) {
             return cue
         }
         return fallbackCue(for: player, cueID: playbackID(for: player))
@@ -2603,8 +2982,19 @@ final class AppModel: ObservableObject {
     }
 
     func fallbackCueAfterPlaybackFailure(for player: Player, failedCue: Cue) -> Cue? {
-        guard case .appleMusic = failedCue.source else { return nil }
-        return fallbackCue(for: player, cueID: failedCue.id)
+        guard case .builtInClip = failedCue.source else {
+            return fallbackCue(for: player, cueID: failedCue.id)
+        }
+        return nil
+    }
+
+    private func fallbackCueAfterPlaybackFailure(for player: Player, plan: PlayerPlaybackPlan) -> Cue? {
+        switch plan {
+        case .cue(let cue, _, _):
+            return fallbackCueAfterPlaybackFailure(for: player, failedCue: cue)
+        case .assetOnly:
+            return fallbackCue(for: player, cueID: playbackID(for: player))
+        }
     }
 
     private func cueIsPlayable(_ cue: Cue) -> Bool {
@@ -2641,13 +3031,13 @@ final class AppModel: ObservableObject {
                 return .assetOnly(relativePath: announcerRelativePath, activeCueID: playbackID(for: player))
             }
             guard let fallbackCue = fallbackCue(for: player, cueID: playbackID(for: player)) else { return nil }
-            return .cue(cue: fallbackCue, announcerRelativePath: nil)
+            return .cue(cue: fallbackCue, announcerRelativePath: nil, sourceFamily: .builtinIntentional)
         case .announcerAndSong:
             guard let cue = playableCueForPlayerPlayback(player) else { return nil }
-            return .cue(cue: cue, announcerRelativePath: announcerRelativePath)
+            return .cue(cue: cue, announcerRelativePath: announcerRelativePath, sourceFamily: playerPlaybackSourceFamily(player: player, cue: cue))
         case .songOnly:
             guard let cue = playableCueForPlayerPlayback(player) else { return nil }
-            return .cue(cue: cue, announcerRelativePath: nil)
+            return .cue(cue: cue, announcerRelativePath: nil, sourceFamily: playerPlaybackSourceFamily(player: player, cue: cue))
         }
     }
 
@@ -2664,7 +3054,13 @@ final class AppModel: ObservableObject {
            state.teams.contains(where: { $0.id == selectedTeamID }) {
             return
         }
-        state.selectedTeamID = state.teams.first?.id
+        setSelectedTeamID(state.teams.first?.id)
+    }
+
+    private func setSelectedTeamID(_ teamID: UUID?) {
+        guard state.selectedTeamID != teamID else { return }
+        telemetry.handleTeamBoundaryChange()
+        state.selectedTeamID = teamID
     }
 
     private func normalizeAllTeams() {
@@ -2806,6 +3202,9 @@ final class AppModel: ObservableObject {
         if let photoRelativePath = player.photoRelativePath {
             paths.append(photoRelativePath)
         }
+        if let photoSourceRelativePath = player.photoSourceRelativePath {
+            paths.append(photoSourceRelativePath)
+        }
         if let customAnnouncerRelativePath = player.customAnnouncerRelativePath {
             paths.append(customAnnouncerRelativePath)
         }
@@ -2876,6 +3275,7 @@ final class AppModel: ObservableObject {
     private enum MissingMediaType: String {
         case song = "song"
         case photo = "photo"
+        case photoSource = "full photo source"
         case announcementCue = "Announcement Cue"
     }
 
@@ -2920,6 +3320,10 @@ final class AppModel: ObservableObject {
            !audioAssetService.assetExists(relativePath: photoRelativePath) {
             types.append(.photo)
         }
+        if let photoSourceRelativePath = player.photoSourceRelativePath,
+           !audioAssetService.assetExists(relativePath: photoSourceRelativePath) {
+            types.append(.photoSource)
+        }
         if let customAnnouncerRelativePath = player.customAnnouncerRelativePath,
            !audioAssetService.assetExists(relativePath: customAnnouncerRelativePath) {
             types.append(.announcementCue)
@@ -2937,7 +3341,7 @@ final class AppModel: ObservableObject {
             if missingTypes.contains(.song) {
                 summary.songCount += 1
             }
-            if missingTypes.contains(.photo) {
+            if missingTypes.contains(.photo) || missingTypes.contains(.photoSource) {
                 summary.photoCount += 1
             }
             if missingTypes.contains(.announcementCue) {
@@ -2951,7 +3355,7 @@ final class AppModel: ObservableObject {
     private func playerPartialPrompt(for item: RecentlyDeletedItem, player: Player, missingTypes: [MissingMediaType]) -> PartialRestorePrompt {
         PartialRestorePrompt(
             itemID: item.id,
-            itemType: .customClip,
+            itemType: .player,
             title: "Restore What We Can?",
             message: "\(player.displayName) could not be fully restored because \(playerMissingSummaryText(missingTypes)) missing. You can still restore the player and re-add the missing media afterward."
         )
@@ -2960,7 +3364,7 @@ final class AppModel: ObservableObject {
     private func customClipPartialPrompt(for item: RecentlyDeletedItem, clip: SongClip) -> PartialRestorePrompt {
         PartialRestorePrompt(
             itemID: item.id,
-            itemType: .player,
+            itemType: .customClip,
             title: "Restore What We Can?",
             message: "\(clip.displayName ?? clip.playbackCue.label) could not be fully restored because its audio is unavailable. You can still restore it in its saved position and repair it afterward."
         )
@@ -2989,10 +3393,11 @@ final class AppModel: ObservableObject {
 
     private func restoreDeletedTeam(_ item: RecentlyDeletedItem, deletedTeam: DeletedTeamRecord, partialSummary: MissingMediaSummary?) {
         var restoredTeam = deletedTeam.team
+        restoredTeam.players = restoredTeam.players.map(degradingMissingPhotoSourceIfNeeded)
         restoredTeam.name = restoredTeamName(from: restoredTeam.name)
         restoredTeam.modifiedAt = .now
         state.teams.append(restoredTeam)
-        state.selectedTeamID = restoredTeam.id
+        setSelectedTeamID(restoredTeam.id)
         normalizeLineup(for: state.teams.count - 1)
         state.recentlyDeleted.removeAll { $0.id == item.id }
         scheduleReadinessRefresh()
@@ -3018,6 +3423,7 @@ final class AppModel: ObservableObject {
         }
 
         var restoredPlayer = deletedPlayer.player
+        restoredPlayer = degradingMissingPhotoSourceIfNeeded(restoredPlayer)
         if markPresent {
             restoredPlayer.isPresent = true
         }
@@ -3032,7 +3438,7 @@ final class AppModel: ObservableObject {
         let battingOrderInsertionIndex = min(insertionIndex, state.teams[restoreTeamIndex].session.battingOrder.count)
         state.teams[restoreTeamIndex].session.battingOrder.insert(restoredPlayer.id, at: battingOrderInsertionIndex)
         state.teams[restoreTeamIndex].modifiedAt = .now
-        state.selectedTeamID = state.teams[restoreTeamIndex].id
+        setSelectedTeamID(state.teams[restoreTeamIndex].id)
         normalizeLineup(for: restoreTeamIndex)
         state.recentlyDeleted.removeAll { $0.id == item.id }
         scheduleReadinessRefresh()
@@ -3049,6 +3455,16 @@ final class AppModel: ObservableObject {
         persist()
     }
 
+    private func degradingMissingPhotoSourceIfNeeded(_ player: Player) -> Player {
+        guard let sourcePath = player.photoSourceRelativePath,
+              !audioAssetService.assetExists(relativePath: sourcePath) else { return player }
+        var degraded = player
+        degraded.photoSourceRelativePath = nil
+        degraded.profilePhotoCrop = nil
+        degraded.playerCardPhotoCrop = nil
+        return degraded
+    }
+
     private func restoreDeletedCustomClip(
         _ item: RecentlyDeletedItem,
         deletedClip: DeletedCustomClipRecord,
@@ -3061,7 +3477,7 @@ final class AppModel: ObservableObject {
         let insertionIndex = min(max(deletedClip.previousIndex, 0), state.teams[restoreTeamIndex].teamClips.count)
         state.teams[restoreTeamIndex].teamClips.insert(deletedClip.clip, at: insertionIndex)
         state.teams[restoreTeamIndex].modifiedAt = .now
-        state.selectedTeamID = state.teams[restoreTeamIndex].id
+        setSelectedTeamID(state.teams[restoreTeamIndex].id)
         state.recentlyDeleted.removeAll { $0.id == item.id }
         scheduleTeamClipPreparation(
             teamID: state.teams[restoreTeamIndex].id,
@@ -3071,6 +3487,9 @@ final class AppModel: ObservableObject {
         scheduleReadinessRefresh()
         pendingRecoveryNavigation = .customClip(deletedClip.clip.id)
         let name = deletedClip.clip.displayName ?? deletedClip.clip.playbackCue.label
+        if isMissingMedia {
+            telemetry.recordRepairNeeded(category: "customClip")
+        }
         showBanner(
             isMissingMedia ? "\(name) restored, but it still needs repair." : "\(name) restored.",
             style: isMissingMedia ? .warning : .success
@@ -3606,6 +4025,7 @@ final class AppModel: ObservableObject {
             return nil
         }
         persistSequence += 1
+        latestRequestedPersistenceSequence = persistSequence
         return PersistenceRequest(
             snapshot: snapshot,
             cleanupPaths: cleanupPaths,
@@ -3629,11 +4049,22 @@ final class AppModel: ObservableObject {
         cleanupPaths: Set<String>
     ) {
         switch result {
-        case .written:
+        case .written(let sequence):
+            guard sequence >= latestRequestedPersistenceSequence else { return }
+            latestDurablePersistenceSequence = sequence
+            statePersistenceFailureEpisodeActive = false
             cleanupPaths.forEach(removePersistedAssetIfStillUnreferenced)
-        case .failed(let errorDescription):
+        case .failed(let sequence, let errorDescription):
             pendingAssetCleanupPaths.formUnion(cleanupPaths)
             lastError = errorDescription
+            guard StatePersistenceFailureSemantics.shouldReportFailure(
+                failedSequence: sequence,
+                latestRequestedSequence: latestRequestedPersistenceSequence
+            ) else { return }
+            if !statePersistenceFailureEpisodeActive {
+                statePersistenceFailureEpisodeActive = true
+                telemetry.record(.statePersistenceFailed)
+            }
         case .unconfirmed:
             pendingAssetCleanupPaths.formUnion(cleanupPaths)
         }
@@ -3645,11 +4076,11 @@ final class AppModel: ObservableObject {
         return try decoder.decode(AppState.self, from: Data(contentsOf: AppPaths.stateURL()))
     }
 
-    private static func loadInitialState() -> (state: AppState, warning: String?) {
+    private static func loadInitialState() -> (state: AppState, warning: String?, recoveryReason: String?) {
         do {
             let stateURL = try AppPaths.stateURL()
             guard FileManager.default.fileExists(atPath: stateURL.path) else {
-                return (freshEmptyState(), nil)
+                return (freshEmptyState(), nil, nil)
             }
             let loadedState = try load()
             guard loadedState.schemaVersion <= AppState.currentSchemaVersion else {
@@ -3657,13 +4088,14 @@ final class AppModel: ObservableObject {
                     freshEmptyState(),
                     preserveUnreadableStateFile(
                         loadError: AppError.unsupportedSavedStateVersion
-                    )
+                    ),
+                    "unsupportedSchema"
                 )
             }
-            return (loadedState, nil)
+            return (loadedState, nil, nil)
         } catch {
             let recoveryMessage = preserveUnreadableStateFile(loadError: error)
-            return (freshEmptyState(), recoveryMessage)
+            return (freshEmptyState(), recoveryMessage, "loadFailure")
         }
     }
 
@@ -3720,6 +4152,30 @@ final class AppModel: ObservableObject {
             refreshReadiness()
             persist()
         } catch {
+            switch operationName {
+            case "Package import":
+                let reason: String
+                if let appError = error as? AppError {
+                    switch appError {
+                    case .unsupportedImportVersion: reason = "unsupportedVersion"
+                    case .invalidImport: reason = "invalidPackage"
+                    default: reason = "operationFailed"
+                    }
+                } else {
+                    reason = "operationFailed"
+                }
+                telemetry.record(.packageImportFailed, properties: [.reason: reason])
+            case "Package export":
+                telemetry.record(.packageExportFailed)
+            case "Roster CSV import", "Roster CSV apply":
+                telemetry.record(.csvImportFailed, properties: [
+                    .reason: (error as? AppError).map { if case .invalidCSV = $0 { return "invalidCSV" }; return "operationFailed" } ?? "operationFailed"
+                ])
+            case "Backup restore":
+                telemetry.record(.restoreFailed)
+            default:
+                break
+            }
             lastError = error.localizedDescription
         }
     }
@@ -3866,8 +4322,22 @@ final class AppModel: ObservableObject {
     }
 
     func rememberPreferredLength(_ duration: TimeInterval) {
-        state.trimDefaults.preferredLength = roundedQuarterSecond(duration)
+        let wasDefault = state.trimDefaults.preferredLength == 12
+        let value = roundedQuarterSecond(duration)
+        state.trimDefaults.preferredLength = value
         persist()
+        if wasDefault, value != 12 {
+            let length: String
+            switch value {
+            case 6: length = "6"
+            case 8: length = "8"
+            case 10: length = "10"
+            case 15: length = "15"
+            case let value where value < 12: length = "customShorterThan12"
+            default: length = "customLongerThan12"
+            }
+            telemetry.recordOnce(.trimPreferredLengthFirstChanged, properties: [.newLength: length])
+        }
     }
 
     var recentAppleMusicSelections: [RecentAppleMusicSelection] {
@@ -3997,8 +4467,71 @@ final class AppModel: ObservableObject {
     }
 
     private enum PlayerPlaybackPlan {
-        case cue(cue: Cue, announcerRelativePath: String?)
+        case cue(cue: Cue, announcerRelativePath: String?, sourceFamily: PlaybackSourceFamily)
         case assetOnly(relativePath: String, activeCueID: UUID)
+    }
+
+    private func sourceFamily(for plan: PlayerPlaybackPlan) -> PlaybackSourceFamily {
+        switch plan {
+        case .assetOnly:
+            return .recordedAnnouncement
+        case .cue(_, _, let sourceFamily):
+            return sourceFamily
+        }
+    }
+
+    private func failureSourceFamily(for plan: PlayerPlaybackPlan) -> PlaybackSourceFamily {
+        switch sourceFamily(for: plan) {
+        case .builtinIntentional:
+            return .builtin
+        case let source:
+            return source
+        }
+    }
+
+    private func playbackMode(for teamID: UUID) -> String {
+        state.teams.first(where: { $0.id == teamID })?.session.gameDayAnnouncerMode.rawValue ?? "announcerAndSong"
+    }
+
+    private func playbackSourceFamily(for cue: Cue) -> PlaybackSourceFamily {
+        switch cue.source {
+        case .appleMusic(let source):
+            if source.libraryPersistentID != nil, source.isCatalogBacked == false { return .musicLibrary }
+            return source.isCatalogBacked == false ? .appleMusicPreview : .appleMusicCatalog
+        case .localAudio:
+            return .importedLocal
+        case .builtInClip:
+            return .builtin
+        }
+    }
+
+    private func playerPlaybackSourceFamily(player: Player, cue: Cue) -> PlaybackSourceFamily {
+        if case .localAudio = cue.source,
+           let clip = selectedTeam?.songClip(for: player),
+           clip.hasCurrentGeneratedAsset {
+            return .generatedLocal
+        }
+        switch cue.source {
+        case .builtInClip:
+            return .builtinIntentional
+        default:
+            return playbackSourceFamily(for: cue)
+        }
+    }
+
+    private func gameProperties(for teamID: UUID) -> [RollCallTelemetryProperty: String] {
+        let team = state.teams.first(where: { $0.id == teamID })
+        return [
+            .accent: team.map { accentTelemetryValue($0.accentPreset) } ?? "orange",
+            .volumeAutomation: state.settings.fadeOutVolumeAutomationEnabled ? "on" : "off",
+            .keepScreenAwake: state.settings.keepScreenAwakeDuringLiveUse ? "on" : "off",
+            .darkLiveScreens: state.settings.alwaysUseDarkLiveMode ? "on" : "off",
+            .gameHeuristicVersion: "1"
+        ]
+    }
+
+    private func accentTelemetryValue(_ accent: TeamAccentPreset) -> String {
+        accent == .rollCallOrange ? "orange" : accent.rawValue
     }
 
     private func triggerAnnouncerRegeneration(for teamID: UUID, phase: String) {
@@ -4094,9 +4627,15 @@ struct GeneratedAnnouncerAsset {
     var voiceLanguageCode: String?
 }
 
+enum StatePersistenceFailureSemantics {
+    static func shouldReportFailure(failedSequence: Int, latestRequestedSequence: Int) -> Bool {
+        failedSequence >= latestRequestedSequence
+    }
+}
+
 private enum StatePersistenceResult {
-    case written
-    case failed(String)
+    case written(sequence: Int)
+    case failed(sequence: Int, String)
     case unconfirmed
 }
 
@@ -4140,23 +4679,25 @@ private actor StatePersistenceWriter {
             isWriting = false
         }
 
-        var latestError: String?
-        var completedSequence = latestSequence
+        var finalResult: StatePersistenceResult = .unconfirmed
         while let next = pending {
             pending = nil
-            completedSequence = next.sequence
             do {
                 try AppModel.write(next.state, to: next.destinationURL)
+                finalResult = .written(sequence: next.sequence)
             } catch {
-                latestError = error.localizedDescription
+                finalResult = .failed(sequence: next.sequence, error.localizedDescription)
             }
         }
-        if let latestError {
-            resumeWaiters(through: completedSequence, result: .failed(latestError))
-            return .failed(latestError)
+        let completedSequence: Int
+        switch finalResult {
+        case .written(let sequence), .failed(let sequence, _):
+            completedSequence = sequence
+        case .unconfirmed:
+            completedSequence = latestSequence
         }
-        resumeWaiters(through: completedSequence, result: .written)
-        return .written
+        resumeWaiters(through: completedSequence, result: finalResult)
+        return finalResult
     }
 
     private func resumeWaiters(through sequence: Int, result: StatePersistenceResult) {

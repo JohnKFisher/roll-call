@@ -27,7 +27,7 @@ final class BackupRestoreTests: XCTestCase {
         let packageURL = try writePackageDirectory(
             name: "Incoming.rollcall",
             manifest: TeamPackageManifest(
-                schemaVersion: AppState.currentSchemaVersion,
+                schemaVersion: TeamPackageManifest.currentSchemaVersion,
                 appVersion: "1.0.1",
                 exportedAt: RollCallTestFixtures.now,
                 deviceLabel: "Test Device",
@@ -145,7 +145,7 @@ final class BackupRestoreTests: XCTestCase {
 
     @MainActor
     func testRemovingOneTeamKeepsSharedAssetsUsedByAnotherTeam() throws {
-        let sharedPlayerOne = RollCallTestFixtures.player(
+        var sharedPlayerOne = RollCallTestFixtures.player(
             id: RollCallTestFixtures.alexID,
             name: "Alex Ramirez",
             number: "12",
@@ -153,7 +153,7 @@ final class BackupRestoreTests: XCTestCase {
             photoRelativePath: "shared-photo.jpg",
             customAnnouncerRelativePath: "shared-announcer.caf"
         )
-        let sharedPlayerTwo = RollCallTestFixtures.player(
+        var sharedPlayerTwo = RollCallTestFixtures.player(
             id: RollCallTestFixtures.caseyID,
             name: "Casey Morgan",
             number: "9",
@@ -161,6 +161,8 @@ final class BackupRestoreTests: XCTestCase {
             photoRelativePath: "shared-photo.jpg",
             customAnnouncerRelativePath: "shared-announcer.caf"
         )
+        sharedPlayerOne.photoSourceRelativePath = "shared-photo-master.jpg"
+        sharedPlayerTwo.photoSourceRelativePath = "shared-photo-master.jpg"
         let firstTeam = RollCallTestFixtures.team(players: [sharedPlayerOne])
         var secondTeam = RollCallTestFixtures.team(players: [sharedPlayerTwo])
         secondTeam.id = UUID()
@@ -169,6 +171,7 @@ final class BackupRestoreTests: XCTestCase {
         try writeState(RollCallTestFixtures.appState(teams: [firstTeam, secondTeam], selectedTeamID: firstTeam.id))
         try writeAsset("shared-song.m4a")
         try writeAsset("shared-photo.jpg")
+        try writeAsset("shared-photo-master.jpg")
         try writeAsset("shared-announcer.caf")
         let model = AppModel()
 
@@ -177,7 +180,78 @@ final class BackupRestoreTests: XCTestCase {
         XCTAssertEqual(model.state.teams.map(\.name), ["Lightning"])
         XCTAssertTrue(assetExists("shared-song.m4a"))
         XCTAssertTrue(assetExists("shared-photo.jpg"))
+        XCTAssertTrue(assetExists("shared-photo-master.jpg"))
         XCTAssertTrue(assetExists("shared-announcer.caf"))
+    }
+
+    @MainActor
+    func testReplacingPlayerPhotoKeepsPriorMasterAndProfileReferencedByBackup() async throws {
+        var player = RollCallTestFixtures.player(
+            id: RollCallTestFixtures.alexID,
+            name: "Alex Ramirez",
+            number: "12",
+            photoRelativePath: "old-profile.jpg"
+        )
+        player.photoSourceRelativePath = "old-master.jpg"
+        let team = RollCallTestFixtures.team(players: [player])
+        try writeState(RollCallTestFixtures.appState(team: team))
+        try writeAsset("old-profile.jpg")
+        try writeAsset("old-master.jpg")
+        try writeAsset("new-profile.jpg")
+        try writeAsset("new-master.jpg")
+        let model = AppModel()
+
+        try await model.createBackupAndWait(reason: "Photo replacement test")
+        var draft = try XCTUnwrap(model.selectedTeam?.players.first)
+        draft.photoRelativePath = "new-profile.jpg"
+        draft.photoSourceRelativePath = "new-master.jpg"
+        model.commitPlayerEditorDraft(draft)
+        await model.flushLatestState()
+
+        XCTAssertTrue(assetExists("old-profile.jpg"))
+        XCTAssertTrue(assetExists("old-master.jpg"))
+        XCTAssertTrue(assetExists("new-profile.jpg"))
+        XCTAssertTrue(assetExists("new-master.jpg"))
+    }
+
+    @MainActor
+    func testMissingPhotoMasterRequiresPartialRestoreAndDegradesToProfileOnly() throws {
+        var deletedPlayer = RollCallTestFixtures.player(
+            id: RollCallTestFixtures.alexID,
+            name: "Alex Ramirez",
+            number: "12",
+            photoRelativePath: "profile.jpg"
+        )
+        deletedPlayer.photoSourceRelativePath = "missing-master.jpg"
+        deletedPlayer.profilePhotoCrop = NormalizedPhotoCrop(x: 0.2, y: 0.1, width: 0.5, height: 0.5)
+        deletedPlayer.playerCardPhotoCrop = NormalizedPhotoCrop(x: 0.1, y: 0.05, width: 0.8, height: 0.9)
+        let team = RollCallTestFixtures.team(players: [])
+        let item = RecentlyDeletedItem(
+            id: UUID(),
+            deletedAt: .now,
+            payload: .player(DeletedPlayerRecord(
+                player: deletedPlayer,
+                originalTeamID: team.id,
+                originalTeamName: team.name,
+                previousBattingOrder: [deletedPlayer.id]
+            ))
+        )
+        var state = RollCallTestFixtures.appState(team: team)
+        state.recentlyDeleted = [item]
+        try writeState(state)
+        try writeAsset("profile.jpg")
+        let model = AppModel()
+
+        guard case .partialPrompt = model.restorePreparation(for: item) else {
+            return XCTFail("A missing working master should be disclosed before restore.")
+        }
+        model.restoreRecentlyDeletedItem(item, allowPartial: true)
+        let restored = try XCTUnwrap(model.selectedTeam?.players.first)
+
+        XCTAssertEqual(restored.photoRelativePath, "profile.jpg")
+        XCTAssertNil(restored.photoSourceRelativePath)
+        XCTAssertNil(restored.profilePhotoCrop)
+        XCTAssertNil(restored.playerCardPhotoCrop)
     }
 
     @MainActor

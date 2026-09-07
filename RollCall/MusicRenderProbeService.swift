@@ -320,9 +320,6 @@ struct MusicRenderProbeService: Sendable {
             throw MusicRenderProbeServiceError.exportSessionUnavailable
         }
 
-        exportSession.outputURL = outputURL
-        exportSession.outputFileType = .m4a
-
         let duration = try await asset.load(.duration)
         let durationSeconds = CMTimeGetSeconds(duration)
         let clipLength = durationSeconds.isFinite && durationSeconds > 0

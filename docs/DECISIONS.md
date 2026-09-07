@@ -2,6 +2,34 @@
 
 Use this file as a concise decision log for project-specific architectural, behavioral, tooling, and scope decisions.
 
+## 2026-09-07
+
+- Approved: Player photos use one metadata-stripped, orientation-normalized working master bounded to 3000 pixels, plus an independent compact profile derivative and normalized Player Card crop. One on-device Vision pass seeds both framings; manual adjustments remain optional and follow Player Editor Save/Cancel. Existing cropped-only photos remain valid as the available source until replaced.
+  Rationale: share graphics need pixels outside the compact crop, but exact original file bytes and metadata add privacy/storage cost without product value. A single analysis pass and nondestructive geometry preserve quality while avoiding repetitive setup.
+  Status: approved for 1.3
+
+- Approved: `.rollcall` packages include the new photo master and crop fields additively without raising package schema 9. Older 1.2 importers receive the existing compact profile asset and ignore the new data; a subsequent 1.2 re-export is an accepted lossy downgrade that cannot preserve the 1.3 master or crop geometry.
+  Rationale: team ownership and cross-device reframing require the master to travel, while keeping the established manifest contract preserves useful backward import compatibility instead of rejecting a whole team over additive photo capability.
+  Status: approved for 1.3
+
+- Approved: 1.3 ships one Player Card composition, the owner-selected Broadcast design, at 1200 by 1500 pixels with on-demand preview/rendering and system sharing. Alternative design studies are review artifacts only; there is no template picker, cache, gallery, or Game Day entry.
+  Rationale: one polished design makes the feature visible and shareable without turning Roll Call into a design tool or adding persistent generated-file management.
+  Status: approved for 1.3
+
+- Approved: Quick Game Day is a shared navigation request that never starts playback. The default target is updated only by intentional Game Day entry, not ordinary team browsing; an optional App Intent team overrides it. The app remains iOS 17, while an isolated iOS 18 control extension supplies supported Control Center/Lock Screen surfaces and delegates to the same app-owned resolver and existing Game Day state/readiness path.
+  Rationale: system access should reduce field friction without creating a second game/playback authority, changing older-device behavior, or arbitrarily choosing teams. Separating the extension keeps modern API availability out of the core app.
+  Status: approved for 1.3
+
+## 2026-09-06
+
+- Approved: add privacy-bounded, default-enabled anonymous product telemetry using the official TelemetryDeck Swift SDK pinned initially to 2.14.2 behind a Roll Call-owned typed event/property allowlist. Provide an independent Settings opt-out; do not add an onboarding consent or ATT prompt solely for telemetry; retain the SDK's default IDFV-derived identity, salt, standard metadata, batching, and cache behavior; disclose that a final opt-out transition and already queued events may arrive after opt-out; never transmit team/player/media content or Roll Call-defined identifiers; and separate TestFlight/developer signals with TelemetryDeck Test Mode.
+  Rationale: sparse adoption, probable-game, reliability, and retention signals can answer actionable Roll Call product questions that App Store Connect cannot, while the allowlist, content boundary, honest opt-out semantics, conservative local persistence, and explicit privacy disclosures constrain collection.
+  Status: approved; detailed schema and firing semantics live in `docs/telemetry/ROLL_CALL_TELEMETRY_SPEC.md`
+
+- Approved: replace the 10/20 qualifying-Game-Day-visit rating policy with probable-game-date eligibility. A probable game requires four confirmed player-cue starts across three distinct players over at least 15 minutes with a three-minute inter-cue gap; automatic rating opportunities require two distinct probable-game dates plus seven days since policy enrollment, then five dates plus 30 days since the first sheet was actually shown, with no more than two automatic asks and the documented conservative legacy migration/two-phase crash recovery.
+  Rationale: confirmed probable-game use is stronger evidence of delivered value than entering/leaving Game Day, while distinct dates and elapsed-time safeguards prevent tournaments or compressed testing from making the prompt more eager.
+  Status: approved; supersedes the 2026-06-07 10/20-session threshold decision
+
 ## 2026-06-21
 
 - Approved: add optional StoreKit support contributions in Settings/About, with one-time consumable support and monthly/yearly auto-renewable support, while keeping every Roll Call feature free and excluding support state from team exports and app backups.
@@ -123,7 +151,7 @@ Use this file as a concise decision log for project-specific architectural, beha
 
 - Approved: raise the rating-request thresholds from 5/10 successful Game Day sessions to 10/20 before the 1.1 release, while keeping the same safe non-live presentation rules, cooldown, and single retry shape.
   Rationale: the existing prompt cadence felt too eager for a field-use app, so the ask should wait for more repeated proven value before coaches see it.
-  Status: approved
+  Status: superseded by the 2026-09-06 probable-game-date rating policy
 
 - Approved: add an iOS 18+ Developer Tools experiment that swaps subscribed Apple Music catalog playback from the current MediaPlayer volume-automation backend to MusicKit `ApplicationMusicPlayer.transition` crossfade, while preserving the existing backend everywhere else.
   Rationale: the current fade-out workaround is still provisional and uses deprecated volume behavior, so an isolated opt-in backend experiment is the safest way to learn whether newer MusicKit transition APIs feel better without destabilizing iOS 17 or Release builds.

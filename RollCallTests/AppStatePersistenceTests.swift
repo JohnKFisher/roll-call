@@ -79,6 +79,17 @@ final class AppStatePersistenceTests: XCTestCase {
         temp = nil
     }
 
+    func testPersistenceFailureTelemetryOnlyReflectsLatestRequestedSnapshot() {
+        XCTAssertFalse(StatePersistenceFailureSemantics.shouldReportFailure(
+            failedSequence: 4,
+            latestRequestedSequence: 5
+        ))
+        XCTAssertTrue(StatePersistenceFailureSemantics.shouldReportFailure(
+            failedSequence: 5,
+            latestRequestedSequence: 5
+        ))
+    }
+
     func testWhatsNewReleaseIdentityStaysWithinMajorMinorFamily() {
         XCTAssertEqual(AppMetadata.releaseFamily(for: "1.2.1"), "1.2")
         XCTAssertTrue(AppMetadata.hasSeenWhatsNewRelease("1.2 (76)", for: "1.2.1"))
@@ -160,6 +171,95 @@ final class AppStatePersistenceTests: XCTestCase {
         }
         XCTAssertEqual(decoded.settings, .default)
         XCTAssertEqual(decoded.ratingRequest, .default)
+    }
+
+    @MainActor
+    func testViewingTeamDoesNotReplaceLastIntentionalGameDayTeam() throws {
+        var viewedTeam = RollCallTestFixtures.team()
+        viewedTeam.id = UUID()
+        viewedTeam.name = "Viewed Team"
+        var gameDayTeam = RollCallTestFixtures.team()
+        gameDayTeam.id = UUID()
+        gameDayTeam.name = "Game Day Team"
+        var state = RollCallTestFixtures.appState(teams: [viewedTeam, gameDayTeam], selectedTeamID: gameDayTeam.id)
+        state.lastGameDayTeamID = gameDayTeam.id
+        try writeState(state)
+
+        let model = AppModel()
+        model.selectTeam(viewedTeam)
+
+        XCTAssertEqual(model.state.selectedTeamID, viewedTeam.id)
+        XCTAssertEqual(model.state.lastGameDayTeamID, gameDayTeam.id)
+        model.recordIntentionalGameDayEntry()
+        XCTAssertEqual(model.state.lastGameDayTeamID, viewedTeam.id)
+    }
+
+    @MainActor
+    func testDeletingRememberedGameDayTeamClearsStaleTarget() throws {
+        let team = RollCallTestFixtures.team()
+        var state = RollCallTestFixtures.appState(team: team)
+        state.lastGameDayTeamID = team.id
+        try writeState(state)
+
+        let model = AppModel()
+        model.removeSelectedTeam()
+
+        XCTAssertNil(model.state.lastGameDayTeamID)
+    }
+
+    @MainActor
+    func testQuickGameDayExplicitTargetSelectsAndRemembersTeam() throws {
+        var selected = RollCallTestFixtures.team()
+        selected.id = UUID()
+        var explicit = RollCallTestFixtures.team()
+        explicit.id = UUID()
+        let state = RollCallTestFixtures.appState(teams: [selected, explicit], selectedTeamID: selected.id)
+        try writeState(state)
+        let model = AppModel()
+
+        let resolution = model.resolveOpenGameDay(
+            OpenGameDayRequest(explicitTeamID: explicit.id, source: .appIntent)
+        )
+
+        XCTAssertEqual(resolution, .gameDay(teamID: explicit.id, targetKind: .explicitTeam))
+        XCTAssertEqual(model.state.selectedTeamID, explicit.id)
+        XCTAssertEqual(model.state.lastGameDayTeamID, explicit.id)
+    }
+
+    @MainActor
+    func testQuickGameDayClearsMissingRememberedTarget() throws {
+        let team = RollCallTestFixtures.team()
+        var state = RollCallTestFixtures.appState(team: team)
+        state.lastGameDayTeamID = UUID()
+        try writeState(state)
+        let model = AppModel()
+
+        XCTAssertEqual(
+            model.resolveOpenGameDay(OpenGameDayRequest(source: .systemControl)),
+            .fallback(.rememberedTeamMissing)
+        )
+        XCTAssertNil(model.state.lastGameDayTeamID)
+        XCTAssertEqual(model.state.selectedTeamID, team.id)
+    }
+
+    @MainActor
+    func testPlayerEditorCommitPersistsBothPhotoFramings() throws {
+        let team = RollCallTestFixtures.team()
+        try writeState(RollCallTestFixtures.appState(team: team))
+        let model = AppModel()
+        var draft = try XCTUnwrap(model.selectedTeam?.players.first)
+        draft.photoRelativePath = "profile.jpg"
+        draft.photoSourceRelativePath = "master.jpg"
+        draft.profilePhotoCrop = NormalizedPhotoCrop(x: 0.2, y: 0.1, width: 0.5, height: 0.5)
+        draft.playerCardPhotoCrop = NormalizedPhotoCrop(x: 0.1, y: 0.05, width: 0.75, height: 0.84)
+
+        model.commitPlayerEditorDraft(draft)
+
+        let saved = try XCTUnwrap(model.selectedTeam?.players.first)
+        XCTAssertEqual(saved.photoRelativePath, "profile.jpg")
+        XCTAssertEqual(saved.photoSourceRelativePath, "master.jpg")
+        XCTAssertEqual(saved.profilePhotoCrop, draft.profilePhotoCrop)
+        XCTAssertEqual(saved.playerCardPhotoCrop, draft.playerCardPhotoCrop)
     }
 
     func testPlayerDecodeDefaultsMissingPresenceToPresent() throws {

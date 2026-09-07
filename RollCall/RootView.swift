@@ -58,8 +58,25 @@ private struct WhatsNewBundle {
     let fullChangelogURL: URL
 
     static let current = WhatsNewBundle(
-        family: "1.2",
+        family: "1.3",
         releases: [
+            WhatsNewRelease(
+                version: "1.3",
+                intro: "Make every player feel like the main event—and get to Game Day faster when it matters.",
+                highlights: [
+                    WhatsNewHighlight(
+                        title: "Player Cards",
+                        detail: "Create and share a personalized walk-up card with a player's photo, team, number, and music. Open any player to preview and share their Player Card.",
+                        systemImage: "rectangle.portrait.on.rectangle.portrait"
+                    ),
+                    WhatsNewHighlight(
+                        title: "Quick Game Day",
+                        detail: "Get to Game Day faster from Control Center, the Lock Screen, Action Button, Shortcuts, Siri, or Spotlight on supported devices—without starting playback.",
+                        systemImage: "play.rectangle.fill"
+                    )
+                ],
+                lookingAhead: nil
+            ),
             WhatsNewRelease(
                 version: "1.2",
                 intro: "This MAJOR update makes song setup much smoother, adds Custom Clips, and helps you know what's ready before game day starts.",
@@ -272,7 +289,7 @@ private func applyTabBarAccent(_ tintColor: UIColor, to tabBar: UITabBar) {
     tabBar.scrollEdgeAppearance = standardAppearance
 }
 
-fileprivate enum RatingRequestPresentation: String, Identifiable {
+fileprivate enum RatingRequestPresentation: String, Identifiable, Equatable {
     case automatic
     case manual
 
@@ -413,6 +430,7 @@ struct RootView: View {
     @Environment(\.scenePhase) private var scenePhase
     @ObservedObject var appModel: AppModel
     @ObservedObject private var playbackEngine: CuePlaybackEngine
+    @ObservedObject private var openGameDayRequestCenter = OpenGameDayRequestCenter.shared
     @State private var newTeamName = ""
     @State private var playerEditorRoute: PlayerEditorRoute?
     @State private var packageImportPresented = false
@@ -428,12 +446,15 @@ struct RootView: View {
     @State private var hasResolvedInitialTab = false
     @State private var whatsNewPresentation: WhatsNewPresentation?
     @State private var ratingRequestPresentation: RatingRequestPresentation?
+    @State private var ratingPresentationToken: UUID?
     @State private var supportScreenPresented = false
+    @State private var quickGameDayHelpPresented = false
     @State private var teamPlaylistPreview: TeamAppleMusicPlaylistSummary?
     @State private var showTeamClips = false
     @State private var customClipRepairPrompt: SongClip?
     @State private var customClipManagerInitialClipID: UUID?
     @State private var liveSurfaceSwipeOffset: CGFloat = 0
+    @State private var suppressNextGameDayRecencyUpdate = false
 
     init(appModel: AppModel) {
         self.appModel = appModel
@@ -470,7 +491,9 @@ struct RootView: View {
     private var hasBlockingWhatsNewPresentation: Bool {
         appModel.riskyOperationCount > 0
             || appModel.lastError != nil
+            || appModel.pendingPackageExport != nil
             || appModel.pendingPackageImport != nil
+            || appModel.completedPackageImportAudit != nil
             || appModel.pendingRosterImport != nil
             || packageImportPresented
             || csvImportPresented
@@ -482,6 +505,10 @@ struct RootView: View {
             || whatsNewPresentation != nil
             || ratingRequestPresentation != nil
             || teamPlaylistPreview != nil
+            || showTeamClips
+            || customClipRepairPrompt != nil
+            || supportScreenPresented
+            || quickGameDayHelpPresented
     }
 
     private var isLiveSurfaceSwipeAvailable: Bool {
@@ -513,6 +540,7 @@ struct RootView: View {
     private var canPresentAutomaticWhatsNew: Bool {
         appModel.hasUnseenWhatsNew
             && !appModel.shouldShowOnboarding
+            && isSafeNonLiveTabForWhatsNew
             && !hasBlockingWhatsNewPresentation
     }
 
@@ -528,7 +556,7 @@ struct RootView: View {
         if !appModel.hasEarnedRatingRequest {
             return "Below threshold"
         }
-        if appModel.state.ratingRequest.automaticPromptAttemptCount >= 2 {
+        if appModel.telemetry.ratingSnapshot.automaticAttemptsConsumed >= 2 {
             return "All automatic attempts spent"
         }
         if appModel.hasUnseenWhatsNew {
@@ -583,7 +611,8 @@ struct RootView: View {
 
     private func presentAutomaticRatingRequestIfPossible() {
         guard canPresentAutomaticRatingRequest else { return }
-        appModel.markAutomaticRatingPromptAttempted()
+        guard let token = appModel.reserveAutomaticRatingPresentation() else { return }
+        ratingPresentationToken = token
         ratingRequestPresentation = .automatic
     }
 
@@ -605,6 +634,8 @@ struct RootView: View {
     }
 
     private func presentManualRatingRequestSheet() {
+        guard let token = appModel.reserveManualRatingPresentation() else { return }
+        ratingPresentationToken = token
         ratingRequestPresentation = .manual
     }
 
@@ -616,6 +647,11 @@ struct RootView: View {
         }
 
         if newTab == .gameDay {
+            if suppressNextGameDayRecencyUpdate {
+                suppressNextGameDayRecencyUpdate = false
+            } else if previousTab != .gameDay {
+                appModel.recordIntentionalGameDayEntry()
+            }
             appModel.beginGameDayVisitForRatingIfNeeded()
             appModel.refreshGameDayWarmup()
         }
@@ -623,6 +659,7 @@ struct RootView: View {
             appModel.finalizeGameDayVisitForRatingIfNeeded()
         }
         if newTab == .readiness {
+            appModel.recordReadinessOpened()
             appModel.prepareSongsForReadiness()
         }
     }
@@ -698,6 +735,7 @@ struct RootView: View {
             appModel.refreshGameDayWarmup()
         }
         if newPhase == .active {
+            appModel.handleTelemetryActivation(wasAlreadyActive: previousPhase == .active)
             appModel.prepareSongsAfterForeground()
         }
 
@@ -711,20 +749,25 @@ struct RootView: View {
     }
 
     private func finishLaunchingTask() async {
-            appModel.setSongClipPreparationLiveUseThrottled(
+        appModel.setSongClipPreparationLiveUseThrottled(
             selectedTab == .gameDay || selectedTab == .generalClips
         )
         await appModel.finishLaunchingIfNeeded()
         resolveInitialTabIfNeeded()
-            appModel.setSongClipPreparationLiveUseThrottled(
+        let launchedWithOpenGameDayRequest = openGameDayRequestCenter.pendingRequest != nil
+        processPendingOpenGameDayRequestIfPossible()
+        appModel.setSongClipPreparationLiveUseThrottled(
             selectedTab == .gameDay || selectedTab == .generalClips
         )
         if selectedTab == .gameDay {
             appModel.beginGameDayVisitForRatingIfNeeded()
             appModel.refreshGameDayWarmup()
         }
-        presentAutomaticWhatsNewIfPossible()
-        presentAutomaticRatingRequestIfPossible()
+        if !launchedWithOpenGameDayRequest,
+           openGameDayRequestCenter.pendingRequest == nil {
+            presentAutomaticWhatsNewIfPossible()
+            presentAutomaticRatingRequestIfPossible()
+        }
     }
 
     private func handlePackageImportPick(_ url: URL) {
@@ -747,7 +790,52 @@ struct RootView: View {
     private func resolveInitialTabIfNeeded() {
         guard !hasResolvedInitialTab else { return }
         hasResolvedInitialTab = true
-        selectedTab = RootTab.sensibleInitialTab(for: appModel.selectedTeam)
+        let initialTab = RootTab.sensibleInitialTab(for: appModel.selectedTeam)
+        if initialTab == .gameDay, selectedTab != .gameDay {
+            suppressNextGameDayRecencyUpdate = true
+        }
+        selectedTab = initialTab
+    }
+
+    private func submitOpenGameDayURL(_ url: URL) -> Bool {
+        guard let target = url.rollCallOpenGameDayTarget else { return false }
+        let explicitTeamID: UUID?
+        switch target {
+        case .rememberedTeam:
+            explicitTeamID = nil
+        case .explicitTeam(let teamID):
+            explicitTeamID = teamID
+        }
+        openGameDayRequestCenter.submit(
+            OpenGameDayRequest(explicitTeamID: explicitTeamID, source: .systemControl)
+        )
+        processPendingOpenGameDayRequestIfPossible()
+        return true
+    }
+
+    private func processPendingOpenGameDayRequestIfPossible() {
+        guard hasResolvedInitialTab,
+              let request = openGameDayRequestCenter.pendingRequest else { return }
+
+        if whatsNewPresentation == .automatic {
+            whatsNewPresentation = nil
+        }
+        if ratingRequestPresentation == .automatic {
+            appModel.cancelRatingSheetBeforeAppearance(token: ratingPresentationToken)
+            ratingPresentationToken = nil
+            ratingRequestPresentation = nil
+        }
+
+        guard !hasBlockingWhatsNewPresentation else { return }
+        let resolution = appModel.resolveOpenGameDay(request)
+        switch resolution {
+        case .gameDay:
+            selectedTab = .gameDay
+            appModel.recordQuickGameDayReached()
+        case .fallback:
+            selectedTab = appModel.state.teams.isEmpty ? .players : .teams
+        }
+        openGameDayRequestCenter.consume(id: request.id)
     }
 
     @ViewBuilder
@@ -771,7 +859,17 @@ struct RootView: View {
             .tint(selectedTeamAccentTheme.color(.primary))
             .task { await finishLaunchingTask() }
             .onOpenURL { url in
-                appModel.handleIncomingPackage(url)
+                if !submitOpenGameDayURL(url) {
+                    appModel.handleIncomingPackage(url)
+                }
+            }
+            .onChange(of: openGameDayRequestCenter.pendingRequest) { _, _ in
+                processPendingOpenGameDayRequestIfPossible()
+            }
+            .onChange(of: hasBlockingWhatsNewPresentation) { _, isBlocked in
+                if !isBlocked {
+                    processPendingOpenGameDayRequestIfPossible()
+                }
             }
             .onChange(of: appModel.shouldShowOnboarding) { _, shouldShowOnboarding in
                 if !shouldShowOnboarding {
@@ -1589,7 +1687,7 @@ struct RootView: View {
                 rootTeamBannerHeader(variant: .liveSide, secondaryStatus: gameDayTeamBannerStatus)
             }
             .sheet(isPresented: $showLineupEditor) {
-                LineupEditorSheet(appModel: appModel)
+                LineupEditorSheet(appModel: appModel, isLiveUse: true)
                     .environment(\.colorScheme, effectiveLiveColorScheme)
             }
         }
@@ -1925,6 +2023,18 @@ struct RootView: View {
                         }
                         .buttonStyle(.plain)
 
+                        Toggle(isOn: Binding(
+                            get: { appModel.anonymousUsageAnalyticsEnabled },
+                            set: { appModel.setAnonymousUsageAnalyticsEnabled($0) }
+                        )) {
+                            SettingsRowLabel(
+                                title: "Anonymous Usage Analytics",
+                                detail: "Share anonymous product-use signals with TelemetryDeck. No team, player, song, photo, recording, or file content is sent. You can turn this off at any time.",
+                                systemImage: "chart.bar.xaxis"
+                            )
+                        }
+                        .tint(selectedTeamAccentTheme.color(.primary))
+
                     }
 
                     SettingsSectionGroup(
@@ -1989,6 +2099,17 @@ struct RootView: View {
                         title: "Game Day",
                         helperText: "Keep live-use preferences simple and predictable."
                     ) {
+                        Button {
+                            quickGameDayHelpPresented = true
+                        } label: {
+                            SettingsRowLabel(
+                                title: "Quick Game Day",
+                                detail: "Open Game Day faster with Control Center, the Lock Screen, Action Button, Shortcuts, Siri, or Spotlight.",
+                                systemImage: "play.rectangle.fill"
+                            )
+                        }
+                        .buttonStyle(.plain)
+
                         Toggle(isOn: Binding(
                             get: { appModel.state.settings.alwaysUseDarkLiveMode },
                             set: { appModel.setAlwaysUseDarkLiveMode($0) }
@@ -2091,16 +2212,41 @@ struct RootView: View {
             }
             .sheet(isPresented: $packageSharePresented) {
                 if let exportURL = appModel.exportURL {
-                    ActivityShareSheet(items: [exportURL])
+                    ActivityShareSheet(items: [exportURL]) { completed in
+                        guard completed else { return }
+                        appModel.telemetry.recordPackageExportCompleted()
+                    }
                 }
+            }
+            .sheet(isPresented: $quickGameDayHelpPresented) {
+                QuickGameDayHelpSheet()
             }
         }
         .tint(Color(uiColor: .label))
-        .sheet(item: $ratingRequestPresentation) { _ in
+        .sheet(item: $ratingRequestPresentation, onDismiss: {
+            appModel.cancelRatingSheetBeforeAppearance(token: ratingPresentationToken)
+            ratingPresentationToken = nil
+        }) { presentation in
             RatingRequestSheet(
-                onRate: requestManualRatingReview,
-                onEmailSupport: requestRatingSupportEmail,
-                onSupportDevelopment: openSupportScreenFromRatingPrompt
+                onAppeared: {
+                    guard let token = ratingPresentationToken else { return }
+                    appModel.confirmRatingSheetAppeared(token: token, source: presentation == .automatic ? .automatic : .manual)
+                },
+                onRate: {
+                    appModel.recordRatingAction(.ratingRateSelected, suppressesAutomatic: true)
+                    requestManualRatingReview()
+                },
+                onEmailSupport: {
+                    appModel.recordRatingAction(.ratingFeedbackSelected, suppressesAutomatic: true)
+                    requestRatingSupportEmail()
+                },
+                onNotNow: {
+                    appModel.recordRatingAction(.ratingNotNowSelected, suppressesAutomatic: false)
+                },
+                onSupportDevelopment: {
+                    appModel.recordRatingAction(.ratingSupportSelected, suppressesAutomatic: true)
+                    openSupportScreenFromRatingPrompt()
+                }
             )
         }
         .sheet(isPresented: $supportScreenPresented) {
@@ -2487,7 +2633,7 @@ private struct OnboardingRootView: View {
             .sheet(isPresented: $showLineupEditor, onDismiss: {
                 appModel.markOnboardingLineupSeen()
             }) {
-                LineupEditorSheet(appModel: appModel)
+                LineupEditorSheet(appModel: appModel, isLiveUse: false)
             }
         }
         .rollCallTeamAccentTheme(activeAccentTheme)
@@ -4887,7 +5033,7 @@ private struct AttributionsView: View {
 
                 SettingsSectionGroup(
                     title: "Third-Party Software",
-                    helperText: "Roll Call uses ZIPFoundation to read and write .rollcall packages."
+                    helperText: "Roll Call uses ZIPFoundation for packages and TelemetryDeck for optional anonymous usage analytics."
                 ) {
                     VStack(alignment: .leading, spacing: RollCallSpacingTier.standard.value) {
                         SettingsRowLabel(
@@ -4900,6 +5046,21 @@ private struct AttributionsView: View {
                             SettingsRowLabel(
                                 title: "ZIPFoundation Project",
                                 detail: "github.com/weichsel/ZIPFoundation",
+                                systemImage: "link"
+                            )
+                        }
+                        .buttonStyle(.plain)
+
+                        SettingsRowLabel(
+                            title: "TelemetryDeck Swift SDK 2.14.2",
+                            detail: "MIT License. Copyright TelemetryDeck and contributors.",
+                            systemImage: "chart.bar.xaxis"
+                        )
+
+                        Link(destination: URL(string: "https://github.com/TelemetryDeck/SwiftSDK")!) {
+                            SettingsRowLabel(
+                                title: "TelemetryDeck Swift SDK Project",
+                                detail: "github.com/TelemetryDeck/SwiftSDK",
                                 systemImage: "link"
                             )
                         }
@@ -5033,6 +5194,10 @@ private struct PackageExportPreviewSheet: View {
                     Text("Roll Call will include portable local clips. Apple Music-linked songs remain saved as links and may need Apple Music access on the receiving device.")
                         .rollCallText(.body)
                         .fixedSize(horizontal: false, vertical: true)
+                    Text("For players with newly selected photos, the package also includes Roll Call's clean working master so profile and Player Card framing can be adjusted after import. That image may show more of the original scene than the visible profile crop.")
+                        .rollCallText(.helperText)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
 
                 PackageTransferSummarySection(summary: pending.summary)
@@ -5087,7 +5252,7 @@ private struct PackageImportAuditSheet: View {
 
                 PackageTransferSummarySection(summary: audit.summary)
 
-                Section("Audio Check") {
+                Section("Import Check") {
                     ForEach(audit.items) { item in
                         VStack(alignment: .leading, spacing: 7) {
                             HStack(alignment: .firstTextBaseline, spacing: 8) {
@@ -5112,7 +5277,9 @@ private struct PackageImportAuditSheet: View {
                                 .rollCallText(.helperText)
                                 .foregroundStyle(.secondary)
                                 .fixedSize(horizontal: false, vertical: true)
-                            if item.state == .needsAppleMusic || item.state == .needsRepair {
+                            if item.state == .needsAppleMusic
+                                || item.state == .needsRepair
+                                || item.state == .photoSourceMissing {
                                 Button(item.destination.repairButtonTitle) {
                                     onRepair(item)
                                 }
@@ -5159,6 +5326,7 @@ private extension PackageClipTransferState {
         case .needsAppleMusic: return "Needs Apple Music"
         case .stillPreparing: return "Preparing"
         case .needsRepair: return "Needs Repair"
+        case .photoSourceMissing: return "Profile Only"
         }
     }
 
@@ -5167,6 +5335,7 @@ private extension PackageClipTransferState {
         case .localClipIncluded, .sourceReferenceOnly: return Color.rollCall(.ready)
         case .needsAppleMusicCheck, .stillPreparing: return Color.rollCall(.warning)
         case .needsAppleMusic, .needsRepair: return Color.rollCall(.destructive)
+        case .photoSourceMissing: return Color.rollCall(.warning)
         }
     }
 }
@@ -5346,12 +5515,63 @@ private struct RosterImportPreviewSheet: View {
 
 private struct ActivityShareSheet: UIViewControllerRepresentable {
     let items: [Any]
+    let onCompleted: (Bool) -> Void
+
+    func makeCoordinator() -> Coordinator { Coordinator(onCompleted: onCompleted) }
 
     func makeUIViewController(context: Context) -> UIActivityViewController {
-        UIActivityViewController(activityItems: items, applicationActivities: nil)
+        let controller = UIActivityViewController(activityItems: items, applicationActivities: nil)
+        controller.completionWithItemsHandler = { _, completed, _, _ in
+            onCompleted(completed)
+        }
+        return controller
     }
 
     func updateUIViewController(_ uiViewController: UIActivityViewController, context: Context) {}
+
+    final class Coordinator {
+        let onCompleted: (Bool) -> Void
+        init(onCompleted: @escaping (Bool) -> Void) { self.onCompleted = onCompleted }
+    }
+}
+
+private struct QuickGameDayHelpSheet: View {
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationStack {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    Image(systemName: "play.rectangle.fill")
+                        .font(.system(size: 50, weight: .semibold))
+                        .foregroundStyle(Color.rollCall(.accent))
+                        .accessibilityHidden(true)
+
+                    Text("Open Game Day faster")
+                        .font(.title2.bold())
+
+                    Text("Add Roll Call's Open Game Day control to Control Center or the Lock Screen, assign it to the Action Button, or run Open Game Day from Shortcuts, Siri, or Spotlight.")
+
+                    Label("The control uses the team you most recently opened intentionally in Game Day.", systemImage: "clock.arrow.circlepath")
+                    Label("Shortcuts can optionally choose a specific team.", systemImage: "person.3.fill")
+                    Label("Quick Game Day opens the existing Game Day screen. It never starts audio automatically.", systemImage: "speaker.slash.fill")
+
+                    Text("System controls require a supported version of iOS. Roll Call's regular Game Day experience remains available on every supported device.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(24)
+            }
+            .navigationTitle("Quick Game Day")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
 }
 
 private struct RollCallPackageImportSheet: UIViewControllerRepresentable {
@@ -6669,6 +6889,7 @@ private struct GameDayPanelIconRow: View {
 private struct LineupEditorSheet: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var appModel: AppModel
+    let isLiveUse: Bool
     @State private var editMode: EditMode = .active
 
     var body: some View {
@@ -6684,12 +6905,12 @@ private struct LineupEditorSheet: View {
                     Section("Lineup") {
                         HStack(spacing: 12) {
                             Button("Sort A-Z") {
-                                appModel.sortBattingOrderAlphabetically()
+                                appModel.sortBattingOrderAlphabetically(recordLiveActivity: isLiveUse)
                             }
                             .buttonStyle(.bordered)
 
                             Button("Sort by Number") {
-                                appModel.sortBattingOrderByNumber()
+                                appModel.sortBattingOrderByNumber(recordLiveActivity: isLiveUse)
                             }
                             .buttonStyle(.bordered)
                         }
@@ -6709,12 +6930,14 @@ private struct LineupEditorSheet: View {
                                 Spacer()
                                 Toggle("", isOn: Binding(
                                     get: { player.isPresent },
-                                    set: { appModel.setPresent(player, isPresent: $0) }
+                                    set: { appModel.setPresent(player, isPresent: $0, recordLiveActivity: isLiveUse) }
                                 ))
                                 .labelsHidden()
                             }
                         }
-                        .onMove(perform: appModel.moveBattingOrder)
+                        .onMove { offsets, offset in
+                            appModel.moveBattingOrder(from: offsets, to: offset, recordLiveActivity: isLiveUse)
+                        }
                     }
 
                     Section("Status") {
@@ -7048,7 +7271,7 @@ private struct DeveloperToolsView: View {
                         }
 
                         LabeledContent("Rating Request", value: appModel.ratingRequestDebugSummary)
-                        LabeledContent("Successful Game Day Sessions", value: "\(appModel.state.ratingRequest.successfulGameDaySessionCount)")
+                        LabeledContent("Probable-Game Dates", value: "\(appModel.telemetry.ratingSnapshot.probableGameDateCount)")
                         LabeledContent("Rating Prompt Status", value: ratingRequestStatus)
 
                         Button(appModel.hasEarnedRatingRequest ? "Mark Rating Threshold Not Met" : "Mark Rating Threshold Met") {
@@ -7474,9 +7697,12 @@ private struct SupportStatusRow: View {
 
 private struct RatingRequestSheet: View {
     @Environment(\.dismiss) private var dismiss
+    @State private var didReportAppearance = false
 
+    let onAppeared: () -> Void
     let onRate: () -> Void
     let onEmailSupport: () -> Void
+    let onNotNow: () -> Void
     let onSupportDevelopment: () -> Void
 
     private var cardShape: RoundedRectangle {
@@ -7533,6 +7759,7 @@ private struct RatingRequestSheet: View {
                             .controlSize(.large)
 
                             Button("Not Now") {
+                                onNotNow()
                                 dismiss()
                             }
                             .buttonStyle(.plain)
@@ -7578,6 +7805,11 @@ private struct RatingRequestSheet: View {
                         dismiss()
                     }
                 }
+            }
+            .onAppear {
+                guard !didReportAppearance else { return }
+                didReportAppearance = true
+                onAppeared()
             }
         }
     }
@@ -7811,9 +8043,11 @@ private struct PlayerRosterMetadataLine: View {
 }
 
 private struct PlayerEditorSheet: View {
-    private struct PendingPhotoCrop: Identifiable {
-        let id = UUID()
-        let image: UIImage
+    private enum PhotoFramingTarget: String, Identifiable {
+        case profile
+        case playerCard
+
+        var id: String { rawValue }
     }
 
     private struct SongReadinessExplanation: Identifiable {
@@ -7833,9 +8067,13 @@ private struct PlayerEditorSheet: View {
     @ObservedObject var appModel: AppModel
     @State var player: Player
     @State private var photoItem: PhotosPickerItem?
-    @State private var pendingPhotoCrop: PendingPhotoCrop?
-    @State private var photoCropFallbackTask: Task<Void, Never>?
-    @State private var didCropperRender = false
+    @State private var isPreparingPhoto = false
+    @State private var photoFramingTarget: PhotoFramingTarget?
+    @State private var photoFramingImage: UIImage?
+    @State private var playerCardPreviewPresented = false
+    @State private var pendingPhotoDetectionResult: PlayerPhotoDetectionResult?
+    @State private var didAdjustProfileFraming = false
+    @State private var didAdjustCardFraming = false
     @State private var songPickerMode: SongPickerMode?
     @State private var showSongFileImporter = false
     @State private var pendingImportedSongURL: URL?
@@ -7859,7 +8097,7 @@ private struct PlayerEditorSheet: View {
         let isCustomIntroMissing = player.customAnnouncerRelativePath != nil && !hasStoredCustomIntro
 
         NavigationStack {
-            Form {
+            AnyView(Form {
                 Section {
                     setupSummaryView
                         .rollCallCard(.status)
@@ -7868,31 +8106,78 @@ private struct PlayerEditorSheet: View {
 
                 Section {
                     let photoRelativePath = player.photoRelativePath
-                    HStack(alignment: .top, spacing: 14) {
-                        VStack(alignment: .leading, spacing: 10) {
-                            TextField("Display Name", text: $player.displayName)
-                                .rollCallText(.body)
-                                .focused($focusedField, equals: .displayName)
-                                .submitLabel(.next)
-                                .onSubmit {
-                                    focusedField = .uniformNumber
-                                }
+                    VStack(alignment: .leading, spacing: 14) {
+                        HStack(alignment: .top, spacing: 14) {
+                            VStack(alignment: .leading, spacing: 10) {
+                                TextField("Display Name", text: $player.displayName)
+                                    .rollCallText(.body)
+                                    .focused($focusedField, equals: .displayName)
+                                    .submitLabel(.next)
+                                    .onSubmit {
+                                        focusedField = .uniformNumber
+                                    }
 
-                            Divider()
+                                Divider()
 
-                            TextField("Uniform Number", text: $player.uniformNumber)
-                                .rollCallText(.body)
-                                .focused($focusedField, equals: .uniformNumber)
-                                .submitLabel(.done)
+                                TextField("Uniform Number", text: $player.uniformNumber)
+                                    .rollCallText(.body)
+                                    .focused($focusedField, equals: .uniformNumber)
+                                    .submitLabel(.done)
+                            }
+
+                            PhotosPicker(selection: $photoItem, matching: .images) {
+                                PlayerEditorPhotoPickerLabel(photoRelativePath: photoRelativePath)
+                            }
+                            .disabled(isPreparingPhoto)
                         }
 
-                        PhotosPicker(selection: $photoItem, matching: .images) {
-                            PlayerEditorPhotoPickerLabel(photoRelativePath: photoRelativePath)
+                        if isPreparingPhoto {
+                            Label("Finding a good profile and Player Card framing…", systemImage: "viewfinder")
+                                .rollCallText(.helperText)
+                        } else if photoRelativePath != nil {
+                            Button {
+                                presentPhotoFraming(.profile)
+                            } label: {
+                                Label("Adjust Profile Photo", systemImage: "crop")
+                            }
+                            .rollCallButtonStyle(.secondary)
+                            .accessibilityHint("Changes the compact photo used throughout Roll Call.")
                         }
                     }
                     .rollCallCard(.identity)
                 } header: {
                     PlayerEditorSectionHeader("Identity")
+                }
+                .playerEditorListRow()
+
+                Section {
+                    Button {
+                        appModel.telemetry.record(.playerCardOpened)
+                        playerCardPreviewPresented = true
+                    } label: {
+                        HStack(spacing: 14) {
+                            Image(systemName: "rectangle.portrait.on.rectangle.portrait")
+                                .font(.title2.weight(.semibold))
+                                .foregroundStyle(appModel.selectedTeam?.accentPreset.color() ?? Color.rollCall(.accent))
+                                .frame(width: 42, height: 52)
+                                .background(Color(uiColor: .tertiarySystemFill), in: RoundedRectangle(cornerRadius: 10, style: .continuous))
+                                .accessibilityHidden(true)
+                            VStack(alignment: .leading, spacing: 4) {
+                                Text("Player Card")
+                                    .rollCallText(.cardTitle)
+                                Text("Create a shareable walk-up card")
+                                    .rollCallText(.helperText)
+                            }
+                            Spacer()
+                            Text("Preview & Share")
+                                .font(.subheadline.weight(.semibold))
+                                .foregroundStyle(appModel.selectedTeam?.accentPreset.color() ?? Color.rollCall(.accent))
+                        }
+                        .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityHint("Opens a full preview before sharing.")
+                    .rollCallCard(.utility)
                 }
                 .playerEditorListRow()
 
@@ -8056,19 +8341,24 @@ private struct PlayerEditorSheet: View {
                     .foregroundStyle(Color.rollCall(.destructive))
                 }
                 .playerEditorListRow()
-            }
+            })
+            .disabled(isPreparingPhoto)
             .listStyle(.insetGrouped)
             .accentWashListBackground()
             .navigationTitle(player.displayName.isEmpty ? "Player" : player.displayName)
-            .interactiveDismissDisabled(hasUnsavedChanges)
+            .interactiveDismissDisabled(hasUnsavedChanges || isPreparingPhoto)
             .scrollDismissesKeyboard(.interactively)
             .dismissesKeyboardOnTap()
             .toolbar {
-                ToolbarItem(placement: .topBarLeading) { Button("Close") { closeEditor() } }
+                ToolbarItem(placement: .topBarLeading) {
+                    Button("Close") { closeEditor() }
+                        .disabled(isPreparingPhoto)
+                }
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Save") {
                         saveAndDismiss()
                     }
+                    .disabled(isPreparingPhoto)
                 }
             }
             .onChange(of: photoItem) { _, _ in
@@ -8171,26 +8461,30 @@ private struct PlayerEditorSheet: View {
                     .presentationDetents([.medium])
                 }
             }
-            .fullScreenCover(item: $pendingPhotoCrop) { pending in
-                BasicPhotoCropperSheet(
-                    image: pending.image,
-                    onReady: {
-                        didCropperRender = true
-                        photoCropFallbackTask?.cancel()
-                        photoCropFallbackTask = nil
-                    },
-                    onCancel: {
-                        photoCropFallbackTask?.cancel()
-                        photoCropFallbackTask = nil
-                        pendingPhotoCrop = nil
-                    },
-                    onApply: { croppedImage in
-                        photoCropFallbackTask?.cancel()
-                        photoCropFallbackTask = nil
-                        savePlayerPhoto(croppedImage)
-                        pendingPhotoCrop = nil
-                    }
-                )
+            .sheet(isPresented: $playerCardPreviewPresented) {
+                if let team = appModel.selectedTeam {
+                    PlayerCardPreviewSheet(
+                        player: $player,
+                        team: team,
+                        onGenerated: {
+                            appModel.telemetry.record(.playerCardGenerated)
+                        },
+                        onGenerationFailed: { reason in
+                            appModel.telemetry.record(.playerCardGenerationFailed, properties: [.reason: reason])
+                        },
+                        onSharePresented: {
+                            appModel.telemetry.record(.playerCardShareInitiated)
+                        },
+                        onCardFramingAdjusted: {
+                            didAdjustCardFraming = true
+                        }
+                    )
+                }
+            }
+            .fullScreenCover(item: $photoFramingTarget) { target in
+                if let photoFramingImage {
+                    photoFramingEditor(for: target, image: photoFramingImage)
+                }
             }
         }
     }
@@ -8408,43 +8702,143 @@ private struct PlayerEditorSheet: View {
     }
 
     private func importPhoto() async {
-        guard let photoItem,
-              let data = try? await photoItem.loadTransferable(type: Data.self),
-              let image = UIImage(data: data)
-        else { return }
-
-        await MainActor.run {
-            photoCropFallbackTask?.cancel()
-            didCropperRender = false
-            pendingPhotoCrop = PendingPhotoCrop(image: image)
-            photoCropFallbackTask = Task {
-                try? await Task.sleep(for: .seconds(1.5))
-                guard !Task.isCancelled else { return }
-                await MainActor.run {
-                    guard !didCropperRender, let pending = pendingPhotoCrop else { return }
-                    savePlayerPhoto(pending.image)
-                    appModel.lastError = "Photo crop screen did not load in time. The original photo is ready in this draft; tap Save to keep it."
-                    pendingPhotoCrop = nil
-                }
+        guard let photoItem else { return }
+        await MainActor.run { isPreparingPhoto = true }
+        do {
+            guard let data = try await photoItem.loadTransferable(type: Data.self) else {
+                throw PlayerPhotoPreparationError.unreadableImage
+            }
+            let prepared = try await PlayerPhotoPreparationService().prepare(data: data)
+            try await MainActor.run {
+                try savePreparedPlayerPhoto(prepared)
+                pendingPhotoDetectionResult = prepared.detectionResult
+                isPreparingPhoto = false
+            }
+        } catch {
+            await MainActor.run {
+                isPreparingPhoto = false
+                appModel.lastError = error.localizedDescription
             }
         }
     }
 
-    private func savePlayerPhoto(_ image: UIImage) {
-        guard let jpeg = image.jpegData(compressionQuality: 0.8),
-              let assetsDir = try? AppPaths.assetsDirectory() else { return }
-        let fileName = "\(UUID().uuidString).jpg"
+    private func savePreparedPlayerPhoto(_ prepared: PreparedPlayerPhoto) throws {
+        let assetsDir = try AppPaths.assetsDirectory()
+        let masterName = "\(UUID().uuidString)-photo-master.jpg"
+        let profileName = "\(UUID().uuidString)-photo-profile.jpg"
         do {
-            try jpeg.write(to: assetsDir.appendingPathComponent(fileName), options: .atomic)
-            if let previousPath = player.photoRelativePath,
-               draftPhotoRelativePaths.contains(previousPath) {
-                appModel.discardUncommittedAsset(relativePath: previousPath)
-                draftPhotoRelativePaths.remove(previousPath)
-            }
-            player.photoRelativePath = fileName
-            draftPhotoRelativePaths.insert(fileName)
+            try prepared.masterJPEG.write(to: assetsDir.appendingPathComponent(masterName), options: .atomic)
+            try prepared.profileJPEG.write(to: assetsDir.appendingPathComponent(profileName), options: .atomic)
         } catch {
-            appModel.lastError = error.localizedDescription
+            try? FileManager.default.removeItem(at: assetsDir.appendingPathComponent(masterName))
+            try? FileManager.default.removeItem(at: assetsDir.appendingPathComponent(profileName))
+            throw error
+        }
+        discardReplacedDraftPhotoAssets()
+        player.photoSourceRelativePath = masterName
+        player.photoRelativePath = profileName
+        player.profilePhotoCrop = prepared.profileCrop
+        player.playerCardPhotoCrop = prepared.cardCrop
+        draftPhotoRelativePaths.formUnion([masterName, profileName])
+    }
+
+    private func discardReplacedDraftPhotoAssets() {
+        for path in draftPhotoRelativePaths {
+            appModel.discardUncommittedAsset(relativePath: path)
+        }
+        draftPhotoRelativePaths.removeAll()
+    }
+
+    private func presentPhotoFraming(_ target: PhotoFramingTarget) {
+        let configuredSourcePath = player.photoSourceRelativePath
+        let candidatePaths = [configuredSourcePath, player.photoRelativePath]
+            .compactMap { $0 }
+            .reduce(into: [String]()) { paths, path in
+                if !paths.contains(path) { paths.append(path) }
+            }
+        let loaded = candidatePaths.lazy.compactMap { path -> (String, UIImage)? in
+            guard let url = try? AppPaths.assetURL(relativePath: path),
+                  let data = try? Data(contentsOf: url),
+                  let image = UIImage(data: data) else { return nil }
+            return (path, image)
+        }.first
+        guard let (loadedPath, image) = loaded else {
+            appModel.lastError = "Roll Call could not load this player's photo."
+            return
+        }
+        if configuredSourcePath != nil, loadedPath != configuredSourcePath {
+            player.photoSourceRelativePath = nil
+            player.profilePhotoCrop = nil
+            player.playerCardPhotoCrop = nil
+        }
+        photoFramingImage = image
+        photoFramingTarget = target
+    }
+
+    private func framingCrop(for target: PhotoFramingTarget, image: UIImage) -> NormalizedPhotoCrop {
+        switch target {
+        case .profile:
+            return player.profilePhotoCrop
+                ?? PlayerPhotoFramingGeometry.centeredCrop(aspectRatio: 1, imageSize: image.size)
+        case .playerCard:
+            return player.playerCardPhotoCrop
+                ?? PlayerPhotoFramingGeometry.centeredCrop(
+                    aspectRatio: PlayerPhotoFramingGeometry.playerCardPhotoAspectRatio,
+                    imageSize: image.size
+                )
+        }
+    }
+
+    private func photoFramingEditor(for target: PhotoFramingTarget, image: UIImage) -> some View {
+        let aspectRatio = target == .profile ? 1.0 : PlayerPhotoFramingGeometry.playerCardPhotoAspectRatio
+        let title = target == .profile ? "Adjust Profile Photo" : "Adjust Player Card Photo"
+
+        return PhotoFramingEditorSheet(
+            image: image,
+            initialCrop: framingCrop(for: target, image: image),
+            aspectRatio: aspectRatio,
+            title: title,
+            onCancel: {
+                photoFramingTarget = nil
+                photoFramingImage = nil
+            },
+            onApply: { crop in
+                applyPhotoFraming(crop, target: target, image: image)
+                photoFramingTarget = nil
+                photoFramingImage = nil
+            }
+        )
+    }
+
+    private func applyPhotoFraming(_ crop: NormalizedPhotoCrop, target: PhotoFramingTarget, image: UIImage?) {
+        switch target {
+        case .profile:
+            guard let image,
+                  let profileImage = image.cropped(to: crop, outputSize: PlayerPhotoPreparationService.profilePixelSize),
+                  let jpeg = profileImage.jpegData(compressionQuality: 0.86) else {
+                appModel.lastError = "Roll Call could not apply that profile framing."
+                return
+            }
+            let legacySourcePath = player.photoSourceRelativePath ?? player.photoRelativePath
+            let profileName = "\(UUID().uuidString)-photo-profile.jpg"
+            do {
+                let assetsDir = try AppPaths.assetsDirectory()
+                try jpeg.write(to: assetsDir.appendingPathComponent(profileName), options: .atomic)
+                if let previousPath = player.photoRelativePath,
+                   draftPhotoRelativePaths.contains(previousPath) {
+                    appModel.discardUncommittedAsset(relativePath: previousPath)
+                    draftPhotoRelativePaths.remove(previousPath)
+                }
+                player.photoSourceRelativePath = legacySourcePath
+                player.photoRelativePath = profileName
+                player.profilePhotoCrop = crop
+                draftPhotoRelativePaths.insert(profileName)
+                didAdjustProfileFraming = true
+            } catch {
+                appModel.lastError = error.localizedDescription
+            }
+        case .playerCard:
+            player.playerCardPhotoCrop = crop
         }
     }
 
@@ -8516,6 +8910,18 @@ private struct PlayerEditorSheet: View {
 
     private func saveAndDismiss() {
         appModel.commitPlayerEditorDraft(player)
+        if let pendingPhotoDetectionResult {
+            appModel.telemetry.record(
+                .playerPhotoDetectionCompleted,
+                properties: [.detection: pendingPhotoDetectionResult.rawValue]
+            )
+        }
+        if didAdjustProfileFraming {
+            appModel.telemetry.record(.playerPhotoProfileFramingAdjusted)
+        }
+        if didAdjustCardFraming {
+            appModel.telemetry.record(.playerPhotoCardFramingAdjusted)
+        }
         didCommitDraft = true
         draftPhotoRelativePaths.removeAll()
         dismiss()

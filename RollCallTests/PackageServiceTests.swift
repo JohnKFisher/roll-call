@@ -39,6 +39,76 @@ final class PackageServiceTests: XCTestCase {
         XCTAssertNil(source.hiddenOriginNote)
     }
 
+    func testNewPhotoMasterAndFramingsRoundTripWithoutRaisingPackageSchema() throws {
+        try Data("profile-photo".utf8).write(to: AppPaths.assetURL(relativePath: "profile.jpg"))
+        try Data("clean-master-photo".utf8).write(to: AppPaths.assetURL(relativePath: "master.jpg"))
+        var player = RollCallTestFixtures.player(
+            id: RollCallTestFixtures.alexID,
+            name: "Alex Ramirez",
+            number: "12",
+            photoRelativePath: "profile.jpg"
+        )
+        player.photoSourceRelativePath = "master.jpg"
+        player.profilePhotoCrop = NormalizedPhotoCrop(x: 0.2, y: 0.1, width: 0.5, height: 0.5)
+        player.playerCardPhotoCrop = NormalizedPhotoCrop(x: 0.1, y: 0.05, width: 0.8, height: 0.9)
+        let team = RollCallTestFixtures.team(players: [player], battingOrder: [player.id])
+
+        let packageURL = try service.export(team: team, state: RollCallTestFixtures.appState(team: team))
+        let preview = try service.preview(packageURL: packageURL)
+        let imported = try service.import(packageURL: packageURL, audioAssetService: AudioAssetService())
+        let importedPlayer = try XCTUnwrap(imported.team.players.first)
+
+        XCTAssertEqual(preview.schemaVersion, TeamPackageManifest.currentSchemaVersion)
+        XCTAssertLessThanOrEqual(preview.schemaVersion, 9, "Roll Call 1.2 must continue accepting the additive package.")
+        XCTAssertNotEqual(importedPlayer.photoRelativePath, player.photoRelativePath)
+        XCTAssertNotEqual(importedPlayer.photoSourceRelativePath, player.photoSourceRelativePath)
+        XCTAssertEqual(importedPlayer.profilePhotoCrop, player.profilePhotoCrop)
+        XCTAssertEqual(importedPlayer.playerCardPhotoCrop, player.playerCardPhotoCrop)
+        XCTAssertTrue(AudioAssetService().assetExists(relativePath: importedPlayer.photoRelativePath ?? ""))
+        XCTAssertTrue(AudioAssetService().assetExists(relativePath: importedPlayer.photoSourceRelativePath ?? ""))
+    }
+
+    func testMissingPhotoMasterImportsProfileOnlyAndClearsMasterRelativeCrops() throws {
+        var player = RollCallTestFixtures.player(
+            id: RollCallTestFixtures.alexID,
+            name: "Alex Ramirez",
+            number: "12",
+            photoRelativePath: "profile.jpg"
+        )
+        player.photoSourceRelativePath = "missing-master.jpg"
+        player.profilePhotoCrop = NormalizedPhotoCrop(x: 0.2, y: 0.1, width: 0.5, height: 0.5)
+        player.playerCardPhotoCrop = NormalizedPhotoCrop(x: 0.1, y: 0.05, width: 0.8, height: 0.9)
+        let team = RollCallTestFixtures.team(players: [player], battingOrder: [player.id])
+        let packageURL = try writePackageDirectory(
+            name: "MissingMaster.rollcall",
+            manifest: TeamPackageManifest(
+                schemaVersion: TeamPackageManifest.currentSchemaVersion,
+                appVersion: "1.3.0",
+                exportedAt: RollCallTestFixtures.now,
+                deviceLabel: "Test Device",
+                team: team
+            )
+        )
+        let assetsURL = packageURL.appendingPathComponent("Assets", isDirectory: true)
+        try FileManager.default.createDirectory(at: assetsURL, withIntermediateDirectories: true)
+        try Data("profile-photo".utf8).write(to: assetsURL.appendingPathComponent("profile.jpg"))
+
+        let result = try service.importWithAudit(
+            packageURL: packageURL,
+            audioAssetService: AudioAssetService(),
+            musicAuthorizationStatus: .denied,
+            appleMusicPlaybackCapability: .unknown
+        )
+        let imported = try XCTUnwrap(result.manifest.team.players.first)
+
+        XCTAssertNotNil(imported.photoRelativePath)
+        XCTAssertNil(imported.photoSourceRelativePath)
+        XCTAssertNil(imported.profilePhotoCrop)
+        XCTAssertNil(imported.playerCardPhotoCrop)
+        XCTAssertTrue(result.audit.items.contains { $0.state == .photoSourceMissing })
+        XCTAssertEqual(result.audit.summary.needsRepairCount, 0)
+    }
+
     func testPreviewRejectsPackageDirectoryWithoutManifest() throws {
         let packageURL = temp.fileURL("Broken.rollcall")
         try FileManager.default.createDirectory(at: packageURL, withIntermediateDirectories: true)
@@ -94,7 +164,7 @@ final class PackageServiceTests: XCTestCase {
         let packageURL = try writePackageDirectory(
             name: "Future.rollcall",
             manifest: TeamPackageManifest(
-                schemaVersion: AppState.currentSchemaVersion + 1,
+                schemaVersion: TeamPackageManifest.currentSchemaVersion + 1,
                 appVersion: "99.0",
                 exportedAt: RollCallTestFixtures.now,
                 deviceLabel: "Future Device",
@@ -118,7 +188,7 @@ final class PackageServiceTests: XCTestCase {
         let packageURL = try writePackageDirectory(
             name: "DuplicateIDs.rollcall",
             manifest: TeamPackageManifest(
-                schemaVersion: AppState.currentSchemaVersion,
+                schemaVersion: TeamPackageManifest.currentSchemaVersion,
                 appVersion: "1.0.1",
                 exportedAt: RollCallTestFixtures.now,
                 deviceLabel: "Test Device",
@@ -141,7 +211,7 @@ final class PackageServiceTests: XCTestCase {
         let packageURL = try writePackageDirectory(
             name: "MissingAsset.rollcall",
             manifest: TeamPackageManifest(
-                schemaVersion: AppState.currentSchemaVersion,
+                schemaVersion: TeamPackageManifest.currentSchemaVersion,
                 appVersion: "1.0.1",
                 exportedAt: RollCallTestFixtures.now,
                 deviceLabel: "Test Device",
@@ -178,7 +248,7 @@ final class PackageServiceTests: XCTestCase {
         let packageURL = try writePackageDirectory(
             name: "UnsafeAsset.rollcall",
             manifest: TeamPackageManifest(
-                schemaVersion: AppState.currentSchemaVersion,
+                schemaVersion: TeamPackageManifest.currentSchemaVersion,
                 appVersion: "1.0.1",
                 exportedAt: RollCallTestFixtures.now,
                 deviceLabel: "Test Device",

@@ -1,82 +1,109 @@
-# AGENTS.md — Universal Agent Router - 7/22/26 Edition
+# Roll Call — Project Instructions
 
-Use this file as the entry point for AI coding agents. Optimize for safety, reversibility, and low token use.
+Follow the global Codex instructions and conditional rules from the active `$CODEX_HOME`.
 
-## Always-on rules
+## Identity and North Star
 
-- Work only in the current repository or explicitly approved workspace.
-- Prefer the smallest safe change that solves the user's request.
-- When the user explicitly asks for a change, approval is implied for the narrow, low-risk implementation of that request. Ask before expanding scope, changing release/signing/privacy/data behavior, adding dependencies, performing destructive actions, or choosing among materially different approaches.
-- Do not perform destructive, irreversible, privacy-sensitive, security-sensitive, compatibility-breaking, release-affecting, materially heavier/slower, or broad-scope changes without explicit approval.
-- Do not add telemetry, analytics, ads, hidden network calls, new permissions, new entitlements, or new third-party dependencies unless explicitly approved.
-- Do not commit, push, tag, merge, rebase, reset, cherry-pick, create branches, or create worktrees unless explicitly instructed. You may suggest good commit points.
-- The user manages branch and worktree strategy manually. Do not prescribe a default branch/worktree workflow unless asked.
-- Treat existing users, saved data, config files, package formats, documented commands, and public/internal interfaces as stable by default.
-- Do not present mocked, partial, placeholder, scaffolded, or unverified work as complete.
-- Once the requested task is complete and verified, stop. Avoid “while I’m here” refactors.
+Roll Call is the public App Store app `Roll Call: Walk-Up Music`.
 
-## Risk vocabulary
+Keep the existing bundle identifier. Do not propose or perform a bundle-ID migration unless the owner explicitly requests it.
 
-A tiny/low-risk edit is small, localized, easily reversible, and does not affect behavior, saved data, permissions, dependencies, release/distribution, public interfaces, durable formats, or existing user workflows beyond the requested narrow change.
+**Game Day is the product. Everything else supports Game Day.**
 
-A material or substantive edit changes or may reasonably affect behavior, user-visible workflows, saved data, migrations, durable file/package formats, dependencies, permissions, entitlements, signing, privacy, networking, build/release/distribution behavior, public docs, documented commands, APIs, URLs, bundle identifiers, or more than a small localized region.
+Product priorities, in order:
 
-A broad-scope change spans multiple unrelated areas, rewrites structure, changes architecture, changes cross-cutting patterns, performs cleanup beyond the requested task, or makes future-facing product/technical decisions not required for the immediate request.
+1. Easy
+2. Personal
+3. Cool
+4. Professional
 
-Risk is determined by impact, not just diff size. A one-line change can be high-risk if it touches data, permissions, signing, release, compatibility, security, privacy, or durable formats.
+Preparation is for decisions. Game Day is for execution. Protect reliability in the live moment above configurability, feature count, monetization, or architectural cleverness.
 
-## Rule hierarchy
+## Core product invariants
 
-Apply instructions in this order:
+- A coach should be able to tap a player during Game Day and have something appropriate happen immediately.
+- Preserve the graceful playback fallback chain. Game Day must never fail silently because ideal media is unavailable.
+- Team state is durable; Game Day/session state is temporary. Restore useful context rather than inventing a formal game-session model.
+- Lineup order is distinct from roster/player ordering.
+- Preserve player/team setup, saved media choices, and source-backed repair information rather than discarding unavailable content.
+- Preserve backward compatibility for existing user data and `.rollcall` packages unless an intentional migration is approved.
+- User teams belong to the user. Manual `.rollcall` import/export is a core ownership, sharing, and backup mechanism.
+- Imports must not overwrite existing teams unexpectedly.
+- Support/purchase state must never travel with team exports or backups.
 
-1. Safety, security, privacy, data integrity, reversibility, and truthfulness
-2. Explicit user instruction in the current task
-3. Explicit project decisions, briefs, decision logs, or release/status docs
-4. Project profile rules
-5. Universal conditional rules
-6. General preferences and defaults
+## Media and live-use reliability
 
-If rules conflict, surface the conflict before proceeding unless the higher-priority rule clearly resolves it.
+Apple Music authorization, Music Library access, local/generated clips, player songs, Announcement Cues, Custom Clips, readiness, playback, and fallback behavior are protected product areas.
 
-## Minimal startup
+When ideal playback cannot execute, preserve the established intent:
 
-Use minimal startup context.
+1. intro + song;
+2. song only;
+3. intro only;
+4. generic cheering fallback.
 
-For tiny, low-risk tasks, read only this file and the files directly needed for the edit.
+Do not silently discard a saved song/source merely because it is unavailable on the current device. Preserve enough source truth to explain, repair, or regenerate it where possible.
 
-For material edits, first report:
+Live playback takes priority over background preparation or maintenance work.
 
-- current working directory
-- current branch, if a git repo
-- `git status --short`, if a git repo
+## Readiness
 
-## Conditional rule files
+Readiness answers: **If the user opens Game Day right now, will this feel good in front of people?**
 
-Load conditional rule files only when their trigger matches the task or when they may change the plan.
+It is not a completion score.
 
-Never read all conditional files as startup/default safety context. Use this router, the project profile if clearly applicable, and the smallest useful set of conditional files. Prefer specific files over broad ones.
+- Never use percentage-complete or Bronze/Silver/Gold-style readiness.
+- Never turn optional polish into setup debt.
+- Missing photos, announcer intros, themes, or similar enhancements do not make a player incomplete.
+- Be honest about portable versus device-dependent playback.
+- Readiness may warn and offer repair actions, but must not block Game Day.
+- Encourage rather than shame; reveal enhancements after success rather than forcing them during onboarding.
 
-Do not report rule files loaded or skipped unless a rule conflict, safety gate, or repo-specific constraint materially affects the task.
+## Product boundaries
 
-Available files are grouped below. Paths are relative to `docs/agent-rules/`; filenames are routing hints. Read the file trigger before using the full file.
+All app features remain free. Optional support contributions may support development but must never unlock features, affect readiness, improve reliability, alter exports, or interrupt live use.
 
-Workflow/context:
-`core-workflow.md`, `context-efficiency.md`, `project-philosophy.md`, `long-running-work.md`, `local-rtk.md`
+Do not add or expand required accounts, cloud sync, social/network features, ads, analytics, generalized sports-management/statistics/scoreboard systems, remote-control infrastructure, heavy DAW-style audio editing, or required cloud backup unless the owner explicitly chooses a new product direction.
 
-Source control/release/docs:
-`git-versioning.md`, `ci-release-distribution.md`, `docs-readme-changelog.md`, `about-licensing-distribution.md`
+Future ideas in `PRODUCT_OPPORTUNITIES.md` are exploratory opportunities, not an approved roadmap. Prefer improvements driven by real field use and observed friction over feature accumulation.
 
-Platforms:
-`platform-apple.md`, `platform-windows.md`, `platform-web.md`, `platform-tauri.md`, `cross-platform.md`
+## UX and appearance
 
-Data/media/safety:
-`user-data-permissions.md`, `migration-format-safety.md`, `media-render-export.md`, `diagnostics-privacy.md`, `untrusted-input-tools.md`, `dependencies-assets.md`, `ai-inference.md`
+- Keep setup approachable; avoid tutorial overload, permission barrages, and setup-as-homework.
+- Ask for permissions after the user expresses intent, not preemptively.
+- Confirm irreversible actions; prefer recovery over repeated defensive confirmations.
+- Never interrupt Game Day with ratings, support solicitation, or unrelated prompts.
+- `Game Day` and `Clips` are the live screens. Preserve their deliberate live-use behavior.
+- Do not force a global color scheme merely to make live screens dark.
+- Preserve semantic warning, destructive, readiness, disabled, and playback colors independently from team identity/accent colors.
 
-Always read this project's profile, if it exists, for project-specific overrides:
-`docs/agent-projects/this-project.md`
+## Recovery and destructive operations
 
-## Verification
+Prefer recoverability over immediate destruction.
 
-Verification is required, but scale it to risk. Prefer the cheapest meaningful check. Batch heavyweight checks after coherent related edits. Do not rerun the same failing command without a changed hypothesis.
+Recently Deleted is the normal recovery path for supported deleted teams, players, and Custom Clips. Permanent deletion is secondary and explicit.
 
-Keep final reports proportional to task size and risk. For tiny/local changes, one or two sentences is enough: what changed and the narrow check performed. For normal/risky changes, report what changed, what was checked, what passed/failed, meaningful skipped checks, and known limitations.
+When recovery is incomplete because media is missing, explain the limitation rather than silently presenting a partial restore as complete.
+
+## Documentation authority
+
+Current implementation and current product decisions win over historical plans.
+
+Use:
+
+- `docs/WHERE_WE_STAND.md` for current status and known limitations;
+- `docs/DECISIONS.md` for approved, reversed, and superseded decisions;
+- `docs/product/NORTH_STAR.md` for product purpose and non-negotiables;
+- `docs/product/APP_OVERVIEW.md` for current flows and vocabulary;
+- `docs/product/PRODUCT_SCOPE.md` for durable scope boundaries;
+- `docs/product/UX_RULEBOOK.md` for interaction/live-use rules;
+- `docs/product/READINESS_MODEL.md` for readiness semantics;
+- `docs/product/APPEARANCE_RULES.md` for appearance behavior;
+- `docs/product/ARCHITECTURE_GUARDRAILS.md` for data, ownership, sharing, and reliability constraints;
+- `docs/product/PRODUCT_OPPORTUNITIES.md` for exploratory ideas only.
+
+Read historical documentation only when historical context is actually needed.
+
+If implementation, current documentation, and an established product invariant conflict, surface the conflict rather than silently reinterpreting product intent.
+
+`docs/product/PUBLIC_CHANGELOG.md` is human-curated. Do not edit it unless explicitly asked.

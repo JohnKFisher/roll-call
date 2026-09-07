@@ -364,6 +364,7 @@ enum PackageClipTransferState: String, Codable, Equatable {
     case needsAppleMusic
     case stillPreparing
     case needsRepair
+    case photoSourceMissing
 }
 
 struct PackageTransferSummary: Codable, Equatable {

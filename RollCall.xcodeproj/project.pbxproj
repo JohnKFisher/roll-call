@@ -21,6 +21,11 @@
 		A10000000000000000000012 /* AppIcon.icon in Resources */ = {isa = PBXBuildFile; fileRef = FE483C282FE2450F005E77A0 /* AppIcon.icon */; };
 		A10000000000000000000013 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000114 /* PrivacyInfo.xcprivacy */; };
 		A20000000000000000000001 /* ZIPFoundation in Frameworks */ = {isa = PBXBuildFile; productRef = A20000000000000000000002 /* ZIPFoundation */; };
+		A20000000000000000000004 /* TelemetryDeck in Frameworks */ = {isa = PBXBuildFile; productRef = A20000000000000000000005 /* TelemetryDeck */; };
+		A10000000000000000000014 /* Telemetry.swift in Sources */ = {isa = PBXBuildFile; fileRef = A10000000000000000000115 /* Telemetry.swift */; };
+		A80000000000000000000001 /* PlayerPhotos.swift in Sources */ = {isa = PBXBuildFile; fileRef = A80000000000000000000101 /* PlayerPhotos.swift */; };
+		A80000000000000000000002 /* PlayerCards.swift in Sources */ = {isa = PBXBuildFile; fileRef = A80000000000000000000102 /* PlayerCards.swift */; };
+		A80000000000000000000003 /* QuickGameDay.swift in Sources */ = {isa = PBXBuildFile; fileRef = A80000000000000000000103 /* QuickGameDay.swift */; };
 		A30000000000000000000001 /* RollCallDesignSystem.swift in Sources */ = {isa = PBXBuildFile; fileRef = A30000000000000000000101 /* RollCallDesignSystem.swift */; };
 		A30000000000000000000002 /* RollCallColors.swift in Sources */ = {isa = PBXBuildFile; fileRef = A30000000000000000000102 /* RollCallColors.swift */; };
 		A30000000000000000000003 /* RollCallTypography.swift in Sources */ = {isa = PBXBuildFile; fileRef = A30000000000000000000103 /* RollCallTypography.swift */; };
@@ -38,6 +43,12 @@
 		A40000000000000000000007 /* BackupRestoreTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A40000000000000000000107 /* BackupRestoreTests.swift */; };
 		A40000000000000000000008 /* RootTabStartupTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A40000000000000000000109 /* RootTabStartupTests.swift */; };
 		A40000000000000000000009 /* TeamAppleMusicPlaylistSummaryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A40000000000000000000110 /* TeamAppleMusicPlaylistSummaryTests.swift */; };
+		A40000000000000000000010 /* TelemetryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A40000000000000000000111 /* TelemetryTests.swift */; };
+		A80000000000000000000011 /* PlayerPhotoTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A80000000000000000000111 /* PlayerPhotoTests.swift */; };
+		A80000000000000000000012 /* PlayerCardTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A80000000000000000000112 /* PlayerCardTests.swift */; };
+		A80000000000000000000013 /* QuickGameDayTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A80000000000000000000113 /* QuickGameDayTests.swift */; };
+		A90000000000000000000001 /* QuickGameDayControl.swift in Sources */ = {isa = PBXBuildFile; fileRef = A90000000000000000000101 /* QuickGameDayControl.swift */; };
+		A90000000000000000000002 /* RollCallControls.appex in Embed Foundation Extensions */ = {isa = PBXBuildFile; fileRef = A90000000000000000000103 /* RollCallControls.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		A50000000000000000000001 /* MusicRenderProbeModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = A50000000000000000000101 /* MusicRenderProbeModels.swift */; };
 		A50000000000000000000002 /* MusicRenderProbeService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A50000000000000000000102 /* MusicRenderProbeService.swift */; };
 		A50000000000000000000003 /* MusicRenderProbeView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A50000000000000000000103 /* MusicRenderProbeView.swift */; };
@@ -60,7 +71,28 @@
 			remoteGlobalIDString = A10000000000000000000211;
 			remoteInfo = RollCall;
 		};
+		A90000000000000000000231 /* PBXContainerItemProxy */ = {
+			isa = PBXContainerItemProxy;
+			containerPortal = A10000000000000000000201 /* Project object */;
+			proxyType = 1;
+			remoteGlobalIDString = A90000000000000000000211;
+			remoteInfo = RollCallControls;
+		};
 /* End PBXContainerItemProxy section */
+
+/* Begin PBXCopyFilesBuildPhase section */
+		A90000000000000000000225 /* Embed Foundation Extensions */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 13;
+			files = (
+				A90000000000000000000002 /* RollCallControls.appex in Embed Foundation Extensions */,
+			);
+			name = "Embed Foundation Extensions";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+/* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
 		A10000000000000000000101 /* RollCallApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RollCallApp.swift; sourceTree = "<group>"; };
@@ -77,6 +109,10 @@
 		A10000000000000000000112 /* RollCallDocumentIcon-320x320.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; path = "RollCallDocumentIcon-320x320.png"; sourceTree = "<group>"; };
 		A10000000000000000000113 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
 		A10000000000000000000114 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
+		A10000000000000000000115 /* Telemetry.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = Telemetry.swift; sourceTree = "<group>"; };
+		A80000000000000000000101 /* PlayerPhotos.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerPhotos.swift; sourceTree = "<group>"; };
+		A80000000000000000000102 /* PlayerCards.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerCards.swift; sourceTree = "<group>"; };
+		A80000000000000000000103 /* QuickGameDay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickGameDay.swift; sourceTree = "<group>"; };
 		A30000000000000000000101 /* RollCallDesignSystem.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RollCallDesignSystem.swift; sourceTree = "<group>"; };
 		A30000000000000000000102 /* RollCallColors.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RollCallColors.swift; sourceTree = "<group>"; };
 		A30000000000000000000103 /* RollCallTypography.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RollCallTypography.swift; sourceTree = "<group>"; };
@@ -95,6 +131,13 @@
 		A40000000000000000000108 /* RollCallTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = RollCallTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
 		A40000000000000000000109 /* RootTabStartupTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = RootTabStartupTests.swift; sourceTree = "<group>"; };
 		A40000000000000000000110 /* TeamAppleMusicPlaylistSummaryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TeamAppleMusicPlaylistSummaryTests.swift; sourceTree = "<group>"; };
+		A40000000000000000000111 /* TelemetryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TelemetryTests.swift; sourceTree = "<group>"; };
+		A80000000000000000000111 /* PlayerPhotoTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerPhotoTests.swift; sourceTree = "<group>"; };
+		A80000000000000000000112 /* PlayerCardTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerCardTests.swift; sourceTree = "<group>"; };
+		A80000000000000000000113 /* QuickGameDayTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickGameDayTests.swift; sourceTree = "<group>"; };
+		A90000000000000000000101 /* QuickGameDayControl.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = QuickGameDayControl.swift; sourceTree = "<group>"; };
+		A90000000000000000000102 /* Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = Info.plist; sourceTree = "<group>"; };
+		A90000000000000000000103 /* RollCallControls.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = RollCallControls.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		A50000000000000000000101 /* MusicRenderProbeModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MusicRenderProbeModels.swift; sourceTree = "<group>"; };
 		A50000000000000000000102 /* MusicRenderProbeService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MusicRenderProbeService.swift; sourceTree = "<group>"; };
 		A50000000000000000000103 /* MusicRenderProbeView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MusicRenderProbeView.swift; sourceTree = "<group>"; };
@@ -116,10 +159,18 @@
 			buildActionMask = 2147483647;
 			files = (
 				A20000000000000000000001 /* ZIPFoundation in Frameworks */,
+				A20000000000000000000004 /* TelemetryDeck in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 		A40000000000000000000221 /* Frameworks */ = {
+			isa = PBXFrameworksBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A90000000000000000000221 /* Frameworks */ = {
 			isa = PBXFrameworksBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
@@ -133,6 +184,7 @@
 			isa = PBXGroup;
 			children = (
 				A10000000000000000000142 /* RollCall */,
+				A90000000000000000000142 /* RollCallControls */,
 				A40000000000000000000142 /* RollCallTests */,
 				A10000000000000000000144 /* Products */,
 			);
@@ -153,6 +205,10 @@
 				A10000000000000000000103 /* Services.swift */,
 				A10000000000000000000104 /* AppModel.swift */,
 				A10000000000000000000105 /* RootView.swift */,
+				A10000000000000000000115 /* Telemetry.swift */,
+				A80000000000000000000101 /* PlayerPhotos.swift */,
+				A80000000000000000000102 /* PlayerCards.swift */,
+				A80000000000000000000103 /* QuickGameDay.swift */,
 				A10000000000000000000110 /* BuildEnvironment.swift */,
 				A50000000000000000000101 /* MusicRenderProbeModels.swift */,
 				A50000000000000000000102 /* MusicRenderProbeService.swift */,
@@ -173,6 +229,7 @@
 			isa = PBXGroup;
 			children = (
 				A10000000000000000000107 /* RollCall.app */,
+				A90000000000000000000103 /* RollCallControls.appex */,
 				A40000000000000000000108 /* RollCallTests.xctest */,
 			);
 			name = Products;
@@ -205,6 +262,10 @@
 				A40000000000000000000107 /* BackupRestoreTests.swift */,
 				A40000000000000000000109 /* RootTabStartupTests.swift */,
 				A40000000000000000000110 /* TeamAppleMusicPlaylistSummaryTests.swift */,
+				A40000000000000000000111 /* TelemetryTests.swift */,
+				A80000000000000000000111 /* PlayerPhotoTests.swift */,
+				A80000000000000000000112 /* PlayerCardTests.swift */,
+				A80000000000000000000113 /* QuickGameDayTests.swift */,
 				A60000000000000000000101 /* MusicRenderProbeTests.swift */,
 				A60000000000000000000102 /* SongClipGenerationTests.swift */,
 				A60000000000000000000103 /* GeneratedClipCleanupTests.swift */,
@@ -220,6 +281,15 @@
 			path = TestSupport;
 			sourceTree = "<group>";
 		};
+		A90000000000000000000142 /* RollCallControls */ = {
+			isa = PBXGroup;
+			children = (
+				A90000000000000000000101 /* QuickGameDayControl.swift */,
+				A90000000000000000000102 /* Info.plist */,
+			);
+			path = RollCallControls;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXNativeTarget section */
@@ -230,14 +300,17 @@
 				A10000000000000000000223 /* Sources */,
 				A10000000000000000000221 /* Frameworks */,
 				A10000000000000000000224 /* Resources */,
+				A90000000000000000000225 /* Embed Foundation Extensions */,
 			);
 			buildRules = (
 			);
 			dependencies = (
+				A90000000000000000000232 /* PBXTargetDependency */,
 			);
 			name = RollCall;
 			packageProductDependencies = (
 				A20000000000000000000002 /* ZIPFoundation */,
+				A20000000000000000000005 /* TelemetryDeck */,
 			);
 			productName = RollCall;
 			productReference = A10000000000000000000107 /* RollCall.app */;
@@ -262,6 +335,25 @@
 			productReference = A40000000000000000000108 /* RollCallTests.xctest */;
 			productType = "com.apple.product-type.bundle.unit-test";
 		};
+		A90000000000000000000211 /* RollCallControls */ = {
+			isa = PBXNativeTarget;
+			buildConfigurationList = A90000000000000000000271 /* Build configuration list for PBXNativeTarget "RollCallControls" */;
+			buildPhases = (
+				A90000000000000000000223 /* Sources */,
+				A90000000000000000000221 /* Frameworks */,
+				A90000000000000000000224 /* Resources */,
+			);
+			buildRules = (
+			);
+			dependencies = (
+			);
+			name = RollCallControls;
+			packageProductDependencies = (
+			);
+			productName = RollCallControls;
+			productReference = A90000000000000000000103 /* RollCallControls.appex */;
+			productType = "com.apple.product-type.app-extension";
+		};
 /* End PBXNativeTarget section */
 
 /* Begin PBXProject section */
@@ -279,6 +371,9 @@
 						CreatedOnToolsVersion = 26.4.1;
 						TestTargetID = A10000000000000000000211;
 					};
+					A90000000000000000000211 = {
+						CreatedOnToolsVersion = 27.0;
+					};
 				};
 			};
 			buildConfigurationList = A10000000000000000000270 /* Build configuration list for PBXProject "RollCall" */;
@@ -292,13 +387,15 @@
 			mainGroup = A10000000000000000000141;
 			packageReferences = (
 				A20000000000000000000003 /* XCRemoteSwiftPackageReference "ZIPFoundation" */,
+				A20000000000000000000006 /* XCRemoteSwiftPackageReference "SwiftSDK" */,
 			);
 			productRefGroup = A10000000000000000000144 /* Products */;
 			projectDirPath = "";
 			projectRoot = "";
-			targets = (
-				A10000000000000000000211 /* RollCall */,
-				A40000000000000000000211 /* RollCallTests */,
+				targets = (
+					A10000000000000000000211 /* RollCall */,
+					A90000000000000000000211 /* RollCallControls */,
+					A40000000000000000000211 /* RollCallTests */,
 			);
 		};
 /* End PBXProject section */
@@ -315,6 +412,13 @@
 				A10000000000000000000011 /* RollCallDocumentIcon-320x320.png in Resources */,
 				A10000000000000000000012 /* AppIcon.icon in Resources */,
 				A10000000000000000000013 /* PrivacyInfo.xcprivacy in Resources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A90000000000000000000224 /* Resources */ = {
+			isa = PBXResourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -336,6 +440,10 @@
 				A10000000000000000000003 /* Services.swift in Sources */,
 				A10000000000000000000004 /* AppModel.swift in Sources */,
 				A10000000000000000000005 /* RootView.swift in Sources */,
+				A10000000000000000000014 /* Telemetry.swift in Sources */,
+				A80000000000000000000001 /* PlayerPhotos.swift in Sources */,
+				A80000000000000000000002 /* PlayerCards.swift in Sources */,
+				A80000000000000000000003 /* QuickGameDay.swift in Sources */,
 				A10000000000000000000009 /* BuildEnvironment.swift in Sources */,
 				A50000000000000000000001 /* MusicRenderProbeModels.swift in Sources */,
 				A50000000000000000000002 /* MusicRenderProbeService.swift in Sources */,
@@ -364,9 +472,21 @@
 				A40000000000000000000007 /* BackupRestoreTests.swift in Sources */,
 				A40000000000000000000008 /* RootTabStartupTests.swift in Sources */,
 				A40000000000000000000009 /* TeamAppleMusicPlaylistSummaryTests.swift in Sources */,
+				A40000000000000000000010 /* TelemetryTests.swift in Sources */,
+				A80000000000000000000011 /* PlayerPhotoTests.swift in Sources */,
+				A80000000000000000000012 /* PlayerCardTests.swift in Sources */,
+				A80000000000000000000013 /* QuickGameDayTests.swift in Sources */,
 				A60000000000000000000001 /* MusicRenderProbeTests.swift in Sources */,
 				A60000000000000000000002 /* SongClipGenerationTests.swift in Sources */,
 				A60000000000000000000003 /* GeneratedClipCleanupTests.swift in Sources */,
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+		};
+		A90000000000000000000223 /* Sources */ = {
+			isa = PBXSourcesBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+				A90000000000000000000001 /* QuickGameDayControl.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -377,6 +497,11 @@
 			isa = PBXTargetDependency;
 			target = A10000000000000000000211 /* RollCall */;
 			targetProxy = A40000000000000000000231 /* PBXContainerItemProxy */;
+		};
+		A90000000000000000000232 /* PBXTargetDependency */ = {
+			isa = PBXTargetDependency;
+			target = A90000000000000000000211 /* RollCallControls */;
+			targetProxy = A90000000000000000000231 /* PBXContainerItemProxy */;
 		};
 /* End PBXTargetDependency section */
 
@@ -528,14 +653,14 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 80;
+				CURRENT_PROJECT_VERSION = 111;
 				DEVELOPMENT_TEAM = 5Y9T5WZ4J3;
 				ENABLE_DEBUG_DYLIB = NO;
 				ENABLE_PREVIEWS = NO;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = RollCall/Info.plist;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.sports";
-				MARKETING_VERSION = 1.2.2;
+				MARKETING_VERSION = 1.3.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.jkfisher.rollcall;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphonesimulator iphoneos";
@@ -551,14 +676,14 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 80;
+				CURRENT_PROJECT_VERSION = 111;
 				DEVELOPMENT_TEAM = 5Y9T5WZ4J3;
 				ENABLE_DEBUG_DYLIB = NO;
 				ENABLE_PREVIEWS = NO;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = RollCall/Info.plist;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.sports";
-				MARKETING_VERSION = 1.2.2;
+				MARKETING_VERSION = 1.3.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.jkfisher.rollcall;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphonesimulator iphoneos";
@@ -574,14 +699,14 @@
 				ASSETCATALOG_COMPILER_GLOBAL_ACCENT_COLOR_NAME = AccentColor;
 				ASSETCATALOG_COMPILER_INCLUDE_ALL_APPICON_ASSETS = YES;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 80;
+				CURRENT_PROJECT_VERSION = 111;
 				DEVELOPMENT_TEAM = 5Y9T5WZ4J3;
 				ENABLE_DEBUG_DYLIB = NO;
 				ENABLE_PREVIEWS = NO;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = RollCall/Info.plist;
 				INFOPLIST_KEY_LSApplicationCategoryType = "public.app-category.sports";
-				MARKETING_VERSION = 1.2.2;
+				MARKETING_VERSION = 1.3.0;
 				PRODUCT_BUNDLE_IDENTIFIER = com.jkfisher.rollcall;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SUPPORTED_PLATFORMS = "iphonesimulator iphoneos";
@@ -664,6 +789,82 @@
 			};
 			name = Internal;
 		};
+		A90000000000000000000261 /* Debug */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 111;
+				DEVELOPMENT_TEAM = 5Y9T5WZ4J3;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = RollCallControls/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.3.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.jkfisher.rollcall.controls;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphonesimulator iphoneos";
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Debug;
+		};
+		A90000000000000000000262 /* Release */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 111;
+				DEVELOPMENT_TEAM = 5Y9T5WZ4J3;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = RollCallControls/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.3.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.jkfisher.rollcall.controls;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphonesimulator iphoneos";
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Release;
+		};
+		A90000000000000000000263 /* Internal */ = {
+			isa = XCBuildConfiguration;
+			buildSettings = {
+				APPLICATION_EXTENSION_API_ONLY = YES;
+				CODE_SIGN_STYLE = Automatic;
+				CURRENT_PROJECT_VERSION = 111;
+				DEVELOPMENT_TEAM = 5Y9T5WZ4J3;
+				GENERATE_INFOPLIST_FILE = NO;
+				INFOPLIST_FILE = RollCallControls/Info.plist;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
+				LD_RUNPATH_SEARCH_PATHS = (
+					"$(inherited)",
+					"@executable_path/Frameworks",
+					"@executable_path/../../Frameworks",
+				);
+				MARKETING_VERSION = 1.3.0;
+				PRODUCT_BUNDLE_IDENTIFIER = com.jkfisher.rollcall.controls;
+				PRODUCT_NAME = "$(TARGET_NAME)";
+				SKIP_INSTALL = YES;
+				SUPPORTED_PLATFORMS = "iphonesimulator iphoneos";
+				SWIFT_ACTIVE_COMPILATION_CONDITIONS = INTERNAL;
+				SWIFT_VERSION = 6.0;
+				TARGETED_DEVICE_FAMILY = 1;
+			};
+			name = Internal;
+		};
 /* End XCBuildConfiguration section */
 
 /* Begin XCConfigurationList section */
@@ -697,6 +898,16 @@
 			defaultConfigurationIsVisible = 0;
 			defaultConfigurationName = Debug;
 		};
+		A90000000000000000000271 /* Build configuration list for PBXNativeTarget "RollCallControls" */ = {
+			isa = XCConfigurationList;
+			buildConfigurations = (
+				A90000000000000000000261 /* Debug */,
+				A90000000000000000000263 /* Internal */,
+				A90000000000000000000262 /* Release */,
+			);
+			defaultConfigurationIsVisible = 0;
+			defaultConfigurationName = Release;
+		};
 /* End XCConfigurationList section */
 
 /* Begin XCRemoteSwiftPackageReference section */
@@ -708,6 +919,14 @@
 				minimumVersion = 0.9.0;
 			};
 		};
+		A20000000000000000000006 /* XCRemoteSwiftPackageReference "SwiftSDK" */ = {
+			isa = XCRemoteSwiftPackageReference;
+			repositoryURL = "https://github.com/TelemetryDeck/SwiftSDK.git";
+			requirement = {
+				kind = exactVersion;
+				version = 2.14.2;
+			};
+		};
 /* End XCRemoteSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -715,6 +934,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = A20000000000000000000003 /* XCRemoteSwiftPackageReference "ZIPFoundation" */;
 			productName = ZIPFoundation;
+		};
+		A20000000000000000000005 /* TelemetryDeck */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = A20000000000000000000006 /* XCRemoteSwiftPackageReference "SwiftSDK" */;
+			productName = TelemetryDeck;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

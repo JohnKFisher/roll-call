@@ -6,6 +6,19 @@
 	<string>$(DEVELOPMENT_LANGUAGE)</string>
 	<key>CFBundleDisplayName</key>
 	<string>Roll Call</string>
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleURLName</key>
+			<string>com.jkfisher.rollcall.game-day</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>rollcall</string>
+			</array>
+		</dict>
+	</array>
+	<key>TelemetryDeckAppID</key>
+	<string>55E0EE0E-94F7-4693-A15E-13FD122DD103</string>
 	<key>CFBundleDocumentTypes</key>
 	<array>
 		<dict>
