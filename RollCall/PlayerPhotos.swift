@@ -53,6 +53,31 @@ enum PlayerPhotoDetectionResult: String, Codable, Equatable, Sendable {
     case noUsableDetection
 }
 
+enum PlayerPhotoFramingMode: String, CaseIterable, Hashable, Sendable {
+    case automatic
+    case face
+    case headAndShoulders
+    case upperBody
+    case fullBody
+    case centered
+
+    var title: String {
+        switch self {
+        case .automatic: return "Auto"
+        case .face: return "Face"
+        case .headAndShoulders: return "Head & Shoulders"
+        case .upperBody: return "Upper Body"
+        case .fullBody: return "Full Body"
+        case .centered: return "Centered"
+        }
+    }
+}
+
+struct PlayerPhotoFramingOptionSet: Equatable, Sendable {
+    var profile: [PlayerPhotoFramingMode: NormalizedPhotoCrop]
+    var card: [PlayerPhotoFramingMode: NormalizedPhotoCrop]
+}
+
 struct PlayerPhotoAnalysis: Equatable, Sendable {
     var profileCrop: NormalizedPhotoCrop
     var cardCrop: NormalizedPhotoCrop
@@ -92,10 +117,11 @@ struct PlayerPhotoPreparationService: Sendable {
                 throw PlayerPhotoPreparationError.unreadableImage
             }
 
-            let observations = (try? Self.detect(in: cgImage)) ?? (faces: [], people: [])
+            let observations = (try? Self.detect(in: cgImage)) ?? (faces: [], people: [], upperBodies: [])
             let analysis = PlayerPhotoFramingGeometry.analyze(
                 faces: observations.faces,
                 people: observations.people,
+                upperBodies: observations.upperBodies,
                 imageSize: master.size
             )
             guard let masterJPEG = master.jpegData(compressionQuality: 0.9),
@@ -114,6 +140,28 @@ struct PlayerPhotoPreparationService: Sendable {
         }.value
     }
 
+    func framingOptions(for image: UIImage) async -> PlayerPhotoFramingOptionSet {
+        let normalized = image.rollCallNormalizedUpImage()
+        guard let cgImage = normalized.cgImage else {
+            return PlayerPhotoFramingGeometry.framingOptions(
+                faces: [],
+                people: [],
+                upperBodies: [],
+                imageSize: image.size
+            )
+        }
+
+        return await Task.detached(priority: .userInitiated) {
+            let observations = (try? Self.detect(in: cgImage)) ?? (faces: [], people: [], upperBodies: [])
+            return PlayerPhotoFramingGeometry.framingOptions(
+                faces: observations.faces,
+                people: observations.people,
+                upperBodies: observations.upperBodies,
+                imageSize: CGSize(width: cgImage.width, height: cgImage.height)
+            )
+        }.value
+    }
+
     private static func decodeWorkingMaster(from data: Data) -> UIImage? {
         guard let source = CGImageSourceCreateWithData(data as CFData, nil) else { return nil }
         let options: [CFString: Any] = [
@@ -126,7 +174,7 @@ struct PlayerPhotoPreparationService: Sendable {
         return UIImage(cgImage: image, scale: 1, orientation: .up)
     }
 
-    private static func detect(in image: CGImage) throws -> (faces: [CGRect], people: [CGRect]) {
+    private static func detect(in image: CGImage) throws -> (faces: [CGRect], people: [CGRect], upperBodies: [CGRect]) {
         let faceRequest = VNDetectFaceRectanglesRequest()
         let fullPersonRequest = VNDetectHumanRectanglesRequest()
         fullPersonRequest.upperBodyOnly = false
@@ -148,7 +196,8 @@ struct PlayerPhotoPreparationService: Sendable {
         let upperBodies = (upperBodyRequest.results ?? []).map { topLeftRect($0.boundingBox) }
         return (
             (faceRequest.results ?? []).map { topLeftRect($0.boundingBox) },
-            fullPeople.isEmpty ? upperBodies : fullPeople
+            fullPeople,
+            upperBodies
         )
     }
 }
@@ -161,18 +210,27 @@ enum PlayerPhotoFramingGeometry {
     static func analyze(
         faces: [CGRect],
         people: [CGRect],
+        upperBodies: [CGRect] = [],
         imageSize: CGSize
     ) -> PlayerPhotoAnalysis {
+        let options = framingOptions(
+            faces: faces,
+            people: people,
+            upperBodies: upperBodies,
+            imageSize: imageSize
+        )
         let validFaces = faces.map(clampUnitRect).filter { !$0.isEmpty }
         let validPeople = people.map(clampUnitRect).filter { !$0.isEmpty }
-        let selectedPerson = bestCandidate(in: validPeople)
+        let validUpperBodies = upperBodies.map(clampUnitRect).filter { !$0.isEmpty }
+        let detectionPeople = validPeople.isEmpty ? validUpperBodies : validPeople
+        let selectedPerson = bestCandidate(in: detectionPeople)
         let selectedFace = bestFace(in: validFaces, matching: selectedPerson)
         let faceMatchesSelectedPerson = selectedFace.map { face in
             selectedPerson?.insetBy(dx: -0.04, dy: -0.04)
                 .contains(CGPoint(x: face.midX, y: face.midY)) == true
         } ?? true
         let hasMultiplePeople = validFaces.count > 1
-            || validPeople.count > 1
+            || detectionPeople.count > 1
             || (selectedFace != nil && selectedPerson != nil && !faceMatchesSelectedPerson)
 
         let result: PlayerPhotoDetectionResult
@@ -187,6 +245,31 @@ enum PlayerPhotoFramingGeometry {
         } else {
             result = .noUsableDetection
         }
+
+        return PlayerPhotoAnalysis(
+            profileCrop: options.profile[.automatic] ?? .full,
+            cardCrop: options.card[.automatic] ?? .full,
+            result: result
+        )
+    }
+
+    static func framingOptions(
+        faces: [CGRect],
+        people: [CGRect],
+        upperBodies: [CGRect] = [],
+        imageSize: CGSize
+    ) -> PlayerPhotoFramingOptionSet {
+        let validFaces = faces.map(clampUnitRect).filter { !$0.isEmpty }
+        let validPeople = people.map(clampUnitRect).filter { !$0.isEmpty }
+        let validUpperBodies = upperBodies.map(clampUnitRect).filter { !$0.isEmpty }
+        let selectedPerson = bestCandidate(in: validPeople)
+        let personForMatching = selectedPerson ?? bestCandidate(in: validUpperBodies)
+        let selectedFace = bestFace(in: validFaces, matching: personForMatching)
+        let selectedUpperBody = bestUpperBody(
+            in: validUpperBodies,
+            matching: selectedPerson,
+            face: selectedFace
+        )
 
         let profileAnchor: CGRect
         if let selectedFace {
@@ -203,25 +286,55 @@ enum PlayerPhotoFramingGeometry {
             profileAnchor = CGRect(x: 0.25, y: 0.2, width: 0.5, height: 0.5)
         }
 
-        let cardAnchor: CGRect
-        if let selectedPerson {
-            cardAnchor = selectedPerson.insetBy(dx: -selectedPerson.width * 0.12, dy: -selectedPerson.height * 0.08)
-        } else if let selectedFace {
-            cardAnchor = selectedFace.insetBy(dx: -selectedFace.width * 1.8, dy: -selectedFace.height * 2.1)
-                .offsetBy(dx: 0, dy: selectedFace.height * 0.55)
-        } else {
-            cardAnchor = CGRect(x: 0.12, y: 0.06, width: 0.76, height: 0.88)
+        let cardFallback = CGRect(x: 0.12, y: 0.06, width: 0.76, height: 0.88)
+        let faceAnchor = selectedFace.map {
+            $0.insetBy(dx: -$0.width * 1.8, dy: -$0.height * 2.1)
+                .offsetBy(dx: 0, dy: $0.height * 0.55)
+        } ?? cardFallback
+        let upperBodyAnchor = selectedUpperBody
+            ?? selectedPerson.map(upperPortion(of:))
+            ?? faceAnchor
+        let headAndShouldersAnchor = headAndShoulders(
+            face: selectedFace,
+            upperBody: selectedUpperBody,
+            fallback: upperBodyAnchor
+        )
+        let fullBodyAnchor = selectedPerson ?? selectedUpperBody ?? faceAnchor
+        let automaticCardAnchor = upperBodyAnchor.union(faceAnchor)
+
+        func crop(_ anchor: CGRect, _ aspectRatio: CGFloat) -> NormalizedPhotoCrop {
+            NormalizedPhotoCrop(aspectCrop(containing: anchor, aspectRatio: aspectRatio, imageSize: imageSize))
         }
 
-        return PlayerPhotoAnalysis(
-            profileCrop: NormalizedPhotoCrop(aspectCrop(containing: profileAnchor, aspectRatio: 1, imageSize: imageSize)),
-            cardCrop: NormalizedPhotoCrop(aspectCrop(containing: cardAnchor, aspectRatio: playerCardPhotoAspectRatio, imageSize: imageSize)),
-            result: result
+        return PlayerPhotoFramingOptionSet(
+            profile: [
+                .automatic: crop(profileAnchor, 1),
+                .face: crop(faceAnchor, 1),
+                .headAndShoulders: crop(headAndShouldersAnchor, 1),
+                .upperBody: crop(upperBodyAnchor, 1),
+                .fullBody: crop(fullBodyAnchor, 1),
+                .centered: centeredCrop(aspectRatio: 1, imageSize: imageSize)
+            ],
+            card: [
+                .automatic: crop(automaticCardAnchor, playerCardPhotoAspectRatio),
+                .face: crop(faceAnchor, playerCardPhotoAspectRatio),
+                .headAndShoulders: crop(headAndShouldersAnchor, playerCardPhotoAspectRatio),
+                .upperBody: crop(upperBodyAnchor, playerCardPhotoAspectRatio),
+                .fullBody: crop(fullBodyAnchor, playerCardPhotoAspectRatio),
+                .centered: centeredCrop(aspectRatio: playerCardPhotoAspectRatio, imageSize: imageSize)
+            ]
         )
     }
 
+    /// The largest centred crop of `imageSize` at `aspectRatio`.
+    ///
+    /// The anchor must be the full frame, not a zero-sized centre point.
+    /// `aspectCrop` grows its anchor multiplicatively (`max(w, h * ratio)`), so a
+    /// zero-sized anchor stays zero for every input and yields a degenerate crop —
+    /// which `NormalizedPhotoCrop.clamped()` then floors to 0.01 x 0.01, blowing a
+    /// 1% sliver of the photo up across the whole viewport.
     static func centeredCrop(aspectRatio: CGFloat, imageSize: CGSize) -> NormalizedPhotoCrop {
-        NormalizedPhotoCrop(aspectCrop(containing: CGRect(x: 0.5, y: 0.5, width: 0, height: 0), aspectRatio: aspectRatio, imageSize: imageSize))
+        NormalizedPhotoCrop(aspectCrop(containing: CGRect(x: 0, y: 0, width: 1, height: 1), aspectRatio: aspectRatio, imageSize: imageSize))
     }
 
     private static func bestCandidate(in candidates: [CGRect]) -> CGRect? {
@@ -234,6 +347,35 @@ enum PlayerPhotoFramingGeometry {
             if let best = bestCandidate(in: matching) { return best }
         }
         return bestCandidate(in: faces)
+    }
+
+    private static func bestUpperBody(in bodies: [CGRect], matching person: CGRect?, face: CGRect?) -> CGRect? {
+        let matching = bodies.filter { body in
+            if let face {
+                return body.insetBy(dx: -0.04, dy: -0.04)
+                    .contains(CGPoint(x: face.midX, y: face.midY))
+            }
+            if let person {
+                return person.insetBy(dx: -0.08, dy: -0.08).intersects(body)
+            }
+            return true
+        }
+        return bestCandidate(in: matching.isEmpty ? bodies : matching)
+    }
+
+    private static func upperPortion(of person: CGRect) -> CGRect {
+        CGRect(x: person.minX, y: person.minY, width: person.width, height: min(person.height * 0.62, 1 - person.minY))
+    }
+
+    private static func headAndShoulders(face: CGRect?, upperBody: CGRect?, fallback: CGRect) -> CGRect {
+        guard let upperBody else { return fallback }
+
+        let shoulderWidth = upperBody.width * 1.12
+        let shoulderX = upperBody.midX - shoulderWidth / 2
+        let top = min(upperBody.minY, face?.minY ?? upperBody.minY)
+        let upperBodyHeight = min(upperBody.height * 0.7, 1 - top)
+        let torso = CGRect(x: shoulderX, y: top, width: shoulderWidth, height: upperBodyHeight)
+        return face.map { torso.union($0) } ?? torso
     }
 
     private static func score(_ rect: CGRect) -> CGFloat {
@@ -308,6 +450,7 @@ struct PhotoFramingEditorSheet: View {
     let image: UIImage
     let initialCrop: NormalizedPhotoCrop
     let aspectRatio: CGFloat
+    let framingOptions: [PlayerPhotoFramingMode: NormalizedPhotoCrop]
     let title: String
     let onCancel: () -> Void
     let onApply: (NormalizedPhotoCrop) -> Void
@@ -318,6 +461,28 @@ struct PhotoFramingEditorSheet: View {
     @State private var lastOffset: CGSize = .zero
     @State private var initialized = false
     @State private var viewportSize: CGSize = .zero
+    @State private var selectedCrop: NormalizedPhotoCrop
+    @State private var selectedMode: PlayerPhotoFramingMode?
+
+    init(
+        image: UIImage,
+        initialCrop: NormalizedPhotoCrop,
+        aspectRatio: CGFloat,
+        framingOptions: [PlayerPhotoFramingMode: NormalizedPhotoCrop],
+        title: String,
+        onCancel: @escaping () -> Void,
+        onApply: @escaping (NormalizedPhotoCrop) -> Void
+    ) {
+        self.image = image
+        self.initialCrop = initialCrop
+        self.aspectRatio = aspectRatio
+        self.framingOptions = framingOptions
+        self.title = title
+        self.onCancel = onCancel
+        self.onApply = onApply
+        _selectedCrop = State(initialValue: initialCrop)
+        _selectedMode = State(initialValue: Self.matchingMode(for: initialCrop, options: framingOptions))
+    }
 
     var body: some View {
         NavigationStack {
@@ -325,6 +490,37 @@ struct PhotoFramingEditorSheet: View {
                 Text("Pinch to zoom, then drag to position.")
                     .font(.footnote)
                     .foregroundStyle(.secondary)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Try a framing starting point")
+                        .font(.subheadline.weight(.semibold))
+
+                    LazyVGrid(
+                        columns: [GridItem(.flexible(), spacing: 8), GridItem(.flexible(), spacing: 8)],
+                        spacing: 8
+                    ) {
+                        ForEach(PlayerPhotoFramingMode.allCases, id: \.self) { mode in
+                            Button {
+                                selectFramingMode(mode)
+                            } label: {
+                                Text(mode.title)
+                                    .font(.subheadline.weight(.semibold))
+                                    .frame(maxWidth: .infinity, minHeight: 44)
+                                    .padding(.horizontal, 8)
+                                    .foregroundStyle(selectedMode == mode ? .white : .primary)
+                                    .background(
+                                        selectedMode == mode ? Color.accentColor : Color(uiColor: .secondarySystemFill),
+                                        in: RoundedRectangle(cornerRadius: 10, style: .continuous)
+                                    )
+                                    .contentShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Use \(mode.title) framing")
+                        }
+                    }
+                }
+                .padding(.horizontal, 16)
+                .zIndex(1)
 
                 GeometryReader { geometry in
                     let viewport = fittedViewport(in: geometry.size)
@@ -371,13 +567,11 @@ struct PhotoFramingEditorSheet: View {
                     }
                 }
                 .padding(.horizontal, 16)
+                .zIndex(0)
 
                 HStack(spacing: 12) {
                     Button("Reset") {
-                        zoom = 1
-                        lastZoom = 1
-                        offset = .zero
-                        lastOffset = .zero
+                        resetToSelectedFraming()
                     }
                     .buttonStyle(.bordered)
 
@@ -434,7 +628,12 @@ struct PhotoFramingEditorSheet: View {
 
     private func initializeIfNeeded(viewport: CGSize) {
         guard !initialized, viewport.width > 1, viewport.height > 1 else { return }
-        let crop = initialCrop.clamped().cgRect
+        initialize(viewport: viewport, crop: selectedCrop)
+    }
+
+    private func initialize(viewport: CGSize, crop selectedCrop: NormalizedPhotoCrop) {
+        guard viewport.width > 1, viewport.height > 1 else { return }
+        let crop = selectedCrop.clamped().cgRect
         let base = baseScale(viewport: viewport)
         let effective = viewport.width / max(crop.width * image.size.width, 1)
         zoom = min(max(effective / base, 1), 8)
@@ -518,5 +717,48 @@ struct PhotoFramingEditorSheet: View {
             width: viewport.width / effective / image.size.width,
             height: viewport.height / effective / image.size.height
         ).clamped()
+    }
+
+    private func selectFramingMode(_ mode: PlayerPhotoFramingMode) {
+        guard let crop = framingOptions[mode] else { return }
+        selectedMode = mode
+        selectedCrop = crop
+        resetViewport()
+        if viewportSize.width > 1, viewportSize.height > 1 {
+            initialize(viewport: viewportSize, crop: crop)
+        }
+    }
+
+    private func resetToSelectedFraming() {
+        resetViewport()
+        if viewportSize.width > 1, viewportSize.height > 1 {
+            initializeIfNeeded(viewport: viewportSize)
+        }
+    }
+
+    private func resetViewport() {
+        zoom = 1
+        lastZoom = 1
+        offset = .zero
+        lastOffset = .zero
+        initialized = false
+    }
+
+    private static func matchingMode(
+        for crop: NormalizedPhotoCrop,
+        options: [PlayerPhotoFramingMode: NormalizedPhotoCrop]
+    ) -> PlayerPhotoFramingMode? {
+        PlayerPhotoFramingMode.allCases.first { mode in
+            guard let option = options[mode] else { return false }
+            return cropsMatch(crop, option)
+        }
+    }
+
+    private static func cropsMatch(_ lhs: NormalizedPhotoCrop, _ rhs: NormalizedPhotoCrop) -> Bool {
+        let tolerance = 0.002
+        return abs(lhs.x - rhs.x) <= tolerance
+            && abs(lhs.y - rhs.y) <= tolerance
+            && abs(lhs.width - rhs.width) <= tolerance
+            && abs(lhs.height - rhs.height) <= tolerance
     }
 }

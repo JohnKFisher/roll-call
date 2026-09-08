@@ -390,6 +390,12 @@ final class AppStatePersistenceTests: XCTestCase {
     }
 
     @MainActor
+    /// `flushLatestState()` must have actually written by the time it returns. This
+    /// was intermittently failing (~1 in 4 full-suite runs) because the flush raced
+    /// the write against a one-second timeout and cancelled the write when the main
+    /// actor was busy — dropping the save entirely rather than merely delaying it.
+    /// The assertion is deliberately immediate, with no polling or retry: a flush
+    /// that has returned must already be durable.
     func testFlushLatestStateWritesTheMostRecentSnapshot() async throws {
         let team = RollCallTestFixtures.team()
         try writeState(RollCallTestFixtures.appState(team: team))

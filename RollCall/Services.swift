@@ -1143,10 +1143,21 @@ private final class MediaPlayerCatalogPlaybackController: AppleMusicCatalogPlayb
         String(format: "%.3f", volume)
     }
 
+    /// `MPMusicPlayerController.volume` is a still-public, still-shipping property
+    /// (`MPMusicPlayerController.h`), deprecated back in iOS 7. Because it was
+    /// deprecated before this app's iOS 17 floor, Swift imports it as *unavailable*
+    /// and the typed `player.volume = x` form will not compile — KVC is the only way
+    /// to reach it. This is a deprecated public API, not private SPI.
+    ///
+    /// The one hazard is that KVC is unchecked: if Apple ever removed the property,
+    /// `setValue(_:forKey:)` would raise `NSUnknownKeyException`, which Swift cannot
+    /// catch, terminating the app mid-cue. Probe for the setter first so that day
+    /// degrades to "no volume automation" instead of a crash in front of a crowd.
+    private static let supportsVolumeSetter: Bool =
+        MPMusicPlayerController.instancesRespond(to: NSSelectorFromString("setVolume:"))
+
     private func setPlayerVolume(_ volume: Float) {
-        // `MPMusicPlayerController.volume` is marked unavailable on modern iOS SDKs,
-        // but the application queue player still exposes the underlying Objective-C
-        // setter. Keep this isolated as a provisional on-device experiment.
+        guard Self.supportsVolumeSetter else { return }
         player.setValue(volume, forKey: "volume")
     }
 
@@ -1215,6 +1226,12 @@ final class CuePlaybackEngine: NSObject, ObservableObject {
     private var lastStartDate: Date?
     private var lastStartedCueID: UUID?
     private var sourceBackedVolumeAutomationEnabledForCurrentCue = false
+    /// Progress is published at 20 Hz, which republishes this whole
+    /// `ObservableObject` and rebuilds every view observing it. Game Day observes
+    /// the engine for `activeCueID` but never reads progress, so tracking it during
+    /// a live cue rebuilt the entire board 20 times a second for nothing. Only the
+    /// clip editor asks for it, via `play(cue:tracksProgress:)`.
+    private var tracksProgressForCurrentCue = false
     var onAsynchronousPlaybackResult: ((PlaybackStartConfirmation) -> Void)?
 
     init(
@@ -1231,7 +1248,8 @@ final class CuePlaybackEngine: NSObject, ObservableObject {
         cue: Cue,
         announcerRelativePath: String? = nil,
         fadeOutVolumeAutomationEnabled: Bool = true,
-        sourceFamilyOverride: PlaybackSourceFamily? = nil
+        sourceFamilyOverride: PlaybackSourceFamily? = nil,
+        tracksProgress: Bool = false
     ) async throws -> PlaybackRequestResult {
         if activeCueID == cue.id {
             stop()
@@ -1249,7 +1267,8 @@ final class CuePlaybackEngine: NSObject, ObservableObject {
             activeCueID: cue.id,
             sourceBackedVolumeAutomationEnabled: cue.source.runtimeVolumeAutomationEnabled(
                 whenSettingEnabled: fadeOutVolumeAutomationEnabled
-            )
+            ),
+            tracksProgress: tracksProgress
         )
         lastStartDate = Date()
         lastStartedCueID = cue.id
@@ -1409,9 +1428,14 @@ final class CuePlaybackEngine: NSObject, ObservableObject {
         activeCueID = nil
         activeCueProgress = nil
         sourceBackedVolumeAutomationEnabledForCurrentCue = false
+        tracksProgressForCurrentCue = false
     }
 
-    private func beginPlayback(activeCueID: UUID, sourceBackedVolumeAutomationEnabled: Bool) -> UUID {
+    private func beginPlayback(
+        activeCueID: UUID,
+        sourceBackedVolumeAutomationEnabled: Bool,
+        tracksProgress: Bool = false
+    ) -> UUID {
         // When replacing one cue with another, keep the outgoing cue from briefly
         // restoring its old Apple Music volume before the new cue captures its own anchor.
         stop(restoresCatalogVolume: false)
@@ -1420,6 +1444,7 @@ final class CuePlaybackEngine: NSObject, ObservableObject {
         playbackSessionID = sessionID
         self.activeCueID = activeCueID
         sourceBackedVolumeAutomationEnabledForCurrentCue = sourceBackedVolumeAutomationEnabled
+        tracksProgressForCurrentCue = tracksProgress
         return sessionID
     }
 
@@ -1753,15 +1778,7 @@ final class CuePlaybackEngine: NSObject, ObservableObject {
     }
 
     private func sourceFamily(for cue: Cue) -> PlaybackSourceFamily {
-        switch cue.source {
-        case .appleMusic(let source):
-            if source.libraryPersistentID != nil, source.isCatalogBacked == false { return .musicLibrary }
-            return source.isCatalogBacked == false ? .appleMusicPreview : .appleMusicCatalog
-        case .localAudio:
-            return .importedLocal
-        case .builtInClip:
-            return .builtin
-        }
+        cue.source.playbackSourceFamily
     }
 
     func playbackFailureReason(for error: Error) -> PlaybackFailureReason {
@@ -1858,6 +1875,13 @@ final class CuePlaybackEngine: NSObject, ObservableObject {
 
     private func startProgressTracking(duration: TimeInterval, sessionID: UUID) {
         progressTask?.cancel()
+        progressTask = nil
+        guard tracksProgressForCurrentCue else {
+            // Nobody is watching; publishing 20 times a second would rebuild every
+            // Game Day view observing this engine for no reason.
+            activeCueProgress = nil
+            return
+        }
         let boundedDuration = max(0.01, duration)
         activeCueProgress = 0
         progressTask = Task { [weak self] in
@@ -1911,6 +1935,32 @@ final class CuePlaybackEngine: NSObject, ObservableObject {
 }
 
 extension CueSource {
+    /// Which telemetry source family this cue actually plays back as.
+    ///
+    /// `libraryPersistentID` alone decides "this came from the device's Music
+    /// Library". It is set only by the Music Library picker, and
+    /// `CuePlaybackEngine.startPrimaryCue` resolves the library item on that field
+    /// alone, before it ever considers the catalog — so this matches real playback.
+    ///
+    /// This previously *also* required `isCatalogBacked == false`, a combination the
+    /// app never produces: a library pick with a `playbackStoreID` is recorded as
+    /// catalog-backed, because it is. `.musicLibrary` was therefore unreachable and
+    /// every Music Library cue — the primary song path — reported as
+    /// `.appleMusicCatalog`, while the engine's own confirmation said `.musicLibrary`
+    /// for the same cue. Keep this the only copy of the rule; it was wrong in two
+    /// places at once because it had been duplicated.
+    var playbackSourceFamily: PlaybackSourceFamily {
+        switch self {
+        case .appleMusic(let source):
+            if source.libraryPersistentID != nil { return .musicLibrary }
+            return source.isCatalogBacked == false ? .appleMusicPreview : .appleMusicCatalog
+        case .localAudio:
+            return .importedLocal
+        case .builtInClip:
+            return .builtin
+        }
+    }
+
     func runtimeVolumeAutomationEnabled(whenSettingEnabled settingEnabled: Bool) -> Bool {
         guard settingEnabled else { return false }
         if case .appleMusic = self {

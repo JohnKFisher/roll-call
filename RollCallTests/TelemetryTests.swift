@@ -176,6 +176,102 @@ final class TelemetryTests: XCTestCase {
         XCTAssertEqual(provider.signals.count, firstSignalCount)
     }
 
+    /// A Music Library pick is recorded with `libraryPersistentID` set *and*
+    /// `isCatalogBacked == true` — the song really is in the catalog. The classifiers
+    /// used to require `isCatalogBacked == false` for `.musicLibrary`, a combination
+    /// the app never produces, so `mediaFirstAssignedMusicLibrary` was unreachable
+    /// and every Music Library assignment was counted as a catalog assignment.
+    func testMusicLibraryAssignmentEmitsItsOwnMilestoneNotTheCatalogOne() {
+        let (coordinator, provider, store) = makeCoordinator()
+        var player = RollCallTestFixtures.player(id: RollCallTestFixtures.alexID, name: "Alex", number: "1")
+        player.songAssignment = .privateClip(SongClip(cue: musicLibraryCue()))
+
+        coordinator.enroll(currentState: RollCallTestFixtures.appState(team: RollCallTestFixtures.team(players: [player])))
+
+        XCTAssertTrue(
+            provider.signals.contains { $0.event == .mediaFirstAssignedMusicLibrary },
+            "Music Library is the primary song path and must report as itself."
+        )
+        XCTAssertFalse(
+            provider.signals.contains { $0.event == .mediaFirstAssignedAppleMusicCatalog },
+            "A Music Library pick must not be counted as an Apple Music catalog assignment."
+        )
+        XCTAssertTrue(store.state.baselineCompleted)
+    }
+
+    /// A catalog-only pick (no library id) must still report as catalog, so the fix
+    /// above cannot have simply relabelled everything.
+    func testAppleMusicCatalogAssignmentStillEmitsTheCatalogMilestone() {
+        let (coordinator, provider, _) = makeCoordinator()
+        var player = RollCallTestFixtures.player(id: RollCallTestFixtures.alexID, name: "Alex", number: "1")
+        player.songAssignment = .privateClip(SongClip(cue: RollCallTestFixtures.appleMusicCue(
+            songID: "catalog-song",
+            title: "Catalog Song",
+            artistName: "Artist"
+        )))
+
+        coordinator.enroll(currentState: RollCallTestFixtures.appState(team: RollCallTestFixtures.team(players: [player])))
+
+        XCTAssertTrue(provider.signals.contains { $0.event == .mediaFirstAssignedAppleMusicCatalog })
+        XCTAssertFalse(provider.signals.contains { $0.event == .mediaFirstAssignedMusicLibrary })
+    }
+
+    /// The classifier is shared by playback, recovery and assignment reporting. These
+    /// are the exact shapes the app constructs: `SongPickerFlow` sets a library id
+    /// with `isCatalogBacked: true` for a library pick, leaves the id nil for a
+    /// catalog search hit, and sets `isCatalogBacked: false` for an iTunes preview.
+    func testPlaybackSourceFamilyDistinguishesLibraryCatalogAndPreview() {
+        XCTAssertEqual(musicLibraryCue().source.playbackSourceFamily, .musicLibrary)
+
+        XCTAssertEqual(
+            RollCallTestFixtures.appleMusicCue(songID: "c", title: "C", artistName: "A").source.playbackSourceFamily,
+            .appleMusicCatalog
+        )
+
+        let preview = Cue(
+            id: UUID(),
+            label: "Preview",
+            source: .appleMusic(AppleMusicSource(
+                songID: "12345",
+                title: "Preview",
+                artistName: "Artist",
+                duration: 30,
+                previewURL: URL(string: "https://example.com/p.m4a"),
+                isCatalogBacked: false,
+                libraryPersistentID: nil
+            )),
+            startTime: 0,
+            duration: 12,
+            fadeOutDuration: 0.35,
+            pauseAfterAnnouncer: 0.2
+        )
+        XCTAssertEqual(preview.source.playbackSourceFamily, .appleMusicPreview)
+
+        XCTAssertEqual(RollCallTestFixtures.localCue().source.playbackSourceFamily, .importedLocal)
+    }
+
+    /// Mirrors `SongPickerFlow.openEditorForLibrarySelection`: a library item that
+    /// exposes a `playbackStoreID` is catalog-backed *and* carries a library id.
+    private func musicLibraryCue() -> Cue {
+        Cue(
+            id: UUID(),
+            label: "Library Song",
+            source: .appleMusic(AppleMusicSource(
+                songID: "store-id-1",
+                title: "Library Song",
+                artistName: "Artist",
+                duration: 210,
+                previewURL: nil,
+                isCatalogBacked: true,
+                libraryPersistentID: 987_654_321
+            )),
+            startTime: 0,
+            duration: 12,
+            fadeOutDuration: 0.35,
+            pauseAfterAnnouncer: 0.2
+        )
+    }
+
     func testExistingInstallBaselineKeepsTeamScopedMilestonesDistinct() {
         var firstTeam = RollCallTestFixtures.team()
         firstTeam.accentPreset = .blue
@@ -327,7 +423,20 @@ final class TelemetryTests: XCTestCase {
         let playerIDs = [RollCallTestFixtures.alexID, RollCallTestFixtures.jordanID, RollCallTestFixtures.caseyID]
         let base = store.state.enrollmentDate
 
+        // Cue offsets 0s / 180s / 900s / 900s across three distinct players. Per
+        // spec section 4.2 the session qualifies only on the fourth cue, when all
+        // four conditions hold together: >= 4 cues, >= 3 distinct players,
+        // >= 15 minutes of span (900s, inclusive), and a >= 3 minute gap (the 180s
+        // step, inclusive).
+        //
+        // Qualification is asserted through the emitted `game.probable` signal, not
+        // through `handlePlayerPlayback`'s return value. That return value means
+        // "this cue was accepted and recorded" — a single confirmed cue returns
+        // `true`, as `testStructuredPlaybackRequiresCorrelatedConfirmedStart` pins
+        // down. This test previously read it as a qualification flag and so expected
+        // `false` for the first three cues.
         func playGame(start: Date) {
+            let probableGamesBefore = provider.signals.filter { $0.event == .gameProbable }.count
             for (index, playerID) in [playerIDs[0], playerIDs[1], playerIDs[2], playerIDs[0]].enumerated() {
                 let requestID = UUID()
                 let result = PlaybackRequestResult(
@@ -335,14 +444,22 @@ final class TelemetryTests: XCTestCase {
                     confirmations: [PlaybackStartConfirmation(requestID: requestID, component: .primaryCue, sourceFamily: .importedLocal, outcome: .started)],
                     wasDebounced: false
                 )
-                XCTAssertEqual(
+                XCTAssertTrue(
                     coordinator.handlePlayerPlayback(
                         teamID: teamID,
                         playerID: playerID,
                         result: result,
                         now: start.addingTimeInterval(TimeInterval([0, 180, 900, 900][index]) )
                     ),
-                    index == 3
+                    "Every confirmed cue must be recorded (cue \(index))."
+                )
+
+                // The boundary: nothing qualifies until the fourth cue.
+                let probableGamesNow = provider.signals.filter { $0.event == .gameProbable }.count
+                XCTAssertEqual(
+                    probableGamesNow - probableGamesBefore,
+                    index == 3 ? 1 : 0,
+                    "Session must qualify on the fourth cue and no earlier (cue \(index))."
                 )
             }
         }

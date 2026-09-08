@@ -448,6 +448,10 @@ struct RootView: View {
     @State private var ratingRequestPresentation: RatingRequestPresentation?
     @State private var ratingPresentationToken: UUID?
     @State private var supportScreenPresented = false
+    /// Set when the rating sheet hands off to the support screen, and consumed in the
+    /// rating sheet's `onDismiss`. Presenting the second sheet in the same run loop
+    /// that dismisses the first is a known SwiftUI failure mode.
+    @State private var presentsSupportAfterRatingDismissal = false
     @State private var quickGameDayHelpPresented = false
     @State private var teamPlaylistPreview: TeamAppleMusicPlaylistSummary?
     @State private var showTeamClips = false
@@ -1084,6 +1088,61 @@ struct RootView: View {
             }
             .fileImporter(isPresented: $csvImportPresented, allowedContentTypes: [.commaSeparatedText, .text], allowsMultipleSelection: false) { result in
                 handleRosterImportResult(result)
+            }
+            // The three sheets below are triggered from outside the Settings tab —
+            // the rating prompt from any non-live tab, the share sheet from the Teams
+            // tab's export flow, the support screen from the rating prompt. They used
+            // to be mounted inside `settingsTab`, where they only present if Settings
+            // happens to be the active tab. Root is the only correct host.
+            .sheet(isPresented: $packageSharePresented) {
+                if let exportURL = appModel.exportURL {
+                    ActivityShareSheet(items: [exportURL]) { completed in
+                        guard completed else { return }
+                        appModel.telemetry.recordPackageExportCompleted()
+                    }
+                }
+            }
+            .sheet(item: $ratingRequestPresentation, onDismiss: {
+                appModel.cancelRatingSheetBeforeAppearance(token: ratingPresentationToken)
+                ratingPresentationToken = nil
+                if presentsSupportAfterRatingDismissal {
+                    presentsSupportAfterRatingDismissal = false
+                    supportScreenPresented = true
+                }
+            }) { presentation in
+                RatingRequestSheet(
+                    onAppeared: {
+                        guard let token = ratingPresentationToken else { return }
+                        appModel.confirmRatingSheetAppeared(token: token, source: presentation == .automatic ? .automatic : .manual)
+                    },
+                    onRate: {
+                        appModel.recordRatingAction(.ratingRateSelected, suppressesAutomatic: true)
+                        requestManualRatingReview()
+                    },
+                    onEmailSupport: {
+                        appModel.recordRatingAction(.ratingFeedbackSelected, suppressesAutomatic: true)
+                        requestRatingSupportEmail()
+                    },
+                    onNotNow: {
+                        appModel.recordRatingAction(.ratingNotNowSelected, suppressesAutomatic: false)
+                    },
+                    onSupportDevelopment: {
+                        appModel.recordRatingAction(.ratingSupportSelected, suppressesAutomatic: true)
+                        openSupportScreenFromRatingPrompt()
+                    }
+                )
+            }
+            .sheet(isPresented: $supportScreenPresented) {
+                NavigationStack {
+                    SupportRollCallScreen(onManageSubscriptions: manageSupportSubscriptions)
+                        .toolbar {
+                            ToolbarItem(placement: .topBarTrailing) {
+                                Button("Done") {
+                                    supportScreenPresented = false
+                                }
+                            }
+                        }
+                }
             }
     }
 
@@ -1990,9 +2049,14 @@ struct RootView: View {
     }
 
     private func openSupportScreenFromRatingPrompt() {
+        // Do not present the support screen here: the rating sheet is still
+        // dismissing, and presenting a second sheet in the same run loop as the
+        // first is dismissed is a known SwiftUI failure mode. Flag it and let the
+        // rating sheet's `onDismiss` do the presenting once the transition is done.
+        presentsSupportAfterRatingDismissal = true
         ratingRequestPresentation = nil
+        // Support lives under Settings, so land the user there behind the sheet.
         selectedTab = .settings
-        supportScreenPresented = true
     }
 
     private func manageSupportSubscriptions() {
@@ -2210,57 +2274,15 @@ struct RootView: View {
             .safeAreaInset(edge: .top, spacing: 0) {
                 rootTeamBannerHeader()
             }
-            .sheet(isPresented: $packageSharePresented) {
-                if let exportURL = appModel.exportURL {
-                    ActivityShareSheet(items: [exportURL]) { completed in
-                        guard completed else { return }
-                        appModel.telemetry.recordPackageExportCompleted()
-                    }
-                }
-            }
+            // Only `quickGameDayHelpPresented` stays here: it is the one flag in this
+            // group that can only be set from inside this tab. A sheet whose trigger
+            // can fire from another tab must live on `rootSheetContent`, or it never
+            // presents — see the rating and package-share sheets.
             .sheet(isPresented: $quickGameDayHelpPresented) {
                 QuickGameDayHelpSheet()
             }
         }
         .tint(Color(uiColor: .label))
-        .sheet(item: $ratingRequestPresentation, onDismiss: {
-            appModel.cancelRatingSheetBeforeAppearance(token: ratingPresentationToken)
-            ratingPresentationToken = nil
-        }) { presentation in
-            RatingRequestSheet(
-                onAppeared: {
-                    guard let token = ratingPresentationToken else { return }
-                    appModel.confirmRatingSheetAppeared(token: token, source: presentation == .automatic ? .automatic : .manual)
-                },
-                onRate: {
-                    appModel.recordRatingAction(.ratingRateSelected, suppressesAutomatic: true)
-                    requestManualRatingReview()
-                },
-                onEmailSupport: {
-                    appModel.recordRatingAction(.ratingFeedbackSelected, suppressesAutomatic: true)
-                    requestRatingSupportEmail()
-                },
-                onNotNow: {
-                    appModel.recordRatingAction(.ratingNotNowSelected, suppressesAutomatic: false)
-                },
-                onSupportDevelopment: {
-                    appModel.recordRatingAction(.ratingSupportSelected, suppressesAutomatic: true)
-                    openSupportScreenFromRatingPrompt()
-                }
-            )
-        }
-        .sheet(isPresented: $supportScreenPresented) {
-            NavigationStack {
-                SupportRollCallScreen(onManageSubscriptions: manageSupportSubscriptions)
-                .toolbar {
-                    ToolbarItem(placement: .topBarTrailing) {
-                        Button("Done") {
-                            supportScreenPresented = false
-                        }
-                    }
-                }
-            }
-        }
     }
 
     private var aboutRollCallScreen: some View {
@@ -4028,13 +4050,32 @@ private struct CustomClipsManagerSheet: View {
     @State private var notice: String?
     @State private var editMode: EditMode = .active
 
+    /// Where a completed pick should go. The source pickers are shared between
+    /// adding a new clip and replacing an existing clip's audio.
+    private enum SongPickerTarget: Equatable {
+        case newClip
+        /// Keeps the clip's name and its position in the live Clips grid.
+        case replaceSource(clipID: UUID, name: String)
+    }
+
+    @State private var songPickerTarget: SongPickerTarget = .newClip
+
     init(appModel: AppModel, initialClipID: UUID? = nil) {
         self.appModel = appModel
         self.initialClipID = initialClipID
-        _editingClip = State(
-            initialValue: initialClipID.flatMap { id in
-                appModel.selectedTeam?.teamClips.first(where: { $0.id == id })
-            }
+        let initialClip = initialClipID.flatMap { id in
+            appModel.selectedTeam?.teamClips.first(where: { $0.id == id })
+        }
+        // Arriving from "Repair Clip" or a Recently Deleted restore. Opening the trim
+        // editor on a clip whose audio is missing is useless — it can only move start,
+        // length and fade on a source that cannot play. Say what is wrong instead and
+        // leave Replace Source one tap away in the row menu.
+        let initialClipIsPlayable = initialClip.map { appModel.customClipCanPlay($0) } ?? false
+        _editingClip = State(initialValue: initialClipIsPlayable ? initialClip : nil)
+        _notice = State(
+            initialValue: (initialClip != nil && !initialClipIsPlayable)
+                ? "This clip's audio is unavailable. Use Replace Source on the clip to choose new audio — its name and place in the Clips grid are kept."
+                : nil
         )
     }
 
@@ -4066,16 +4107,19 @@ private struct CustomClipsManagerSheet: View {
 
                 Section("Add Custom Clip") {
                     Button {
+                        songPickerTarget = .newClip
                         songPickerMode = .musicLibrary
                     } label: {
                         Label("Choose from Music Library", systemImage: "music.note.list")
                     }
                     Button {
+                        songPickerTarget = .newClip
                         songPickerMode = .appleMusic
                     } label: {
                         Label("Search Apple Music", systemImage: "magnifyingglass")
                     }
                     Button {
+                        songPickerTarget = .newClip
                         showFileImporter = true
                     } label: {
                         Label("Import Audio or Video", systemImage: "square.and.arrow.down")
@@ -4105,14 +4149,25 @@ private struct CustomClipsManagerSheet: View {
             .sheet(item: $songPickerMode, onDismiss: {
                 songPickerMode = nil
                 importedURL = nil
+                songPickerTarget = .newClip
             }) { mode in
                 SongPickerFlow(
                     appModel: appModel,
                     mode: mode,
                     importedURL: mode == .files ? importedURL : nil
                 ) { cue in
-                    pendingNewCue = cue
-                    newClipName = cue.rosterDisplayTitle
+                    switch songPickerTarget {
+                    case .newClip:
+                        pendingNewCue = cue
+                        newClipName = cue.rosterDisplayTitle
+                    case .replaceSource(let clipID, let name):
+                        // `updateCustomClip` keeps the display name, lineage and list
+                        // position, drops the stale generated asset because the new
+                        // source changes the generation key, and records the repair
+                        // telemetry that previously had no reachable path to fire.
+                        appModel.updateCustomClip(clipID, with: cue, named: name)
+                        notice = "Custom Clip source replaced."
+                    }
                 }
             }
             .sheet(item: $editingClip) { clip in
@@ -4137,10 +4192,14 @@ private struct CustomClipsManagerSheet: View {
             ) { result in
                 switch result {
                 case .success(let urls):
-                    guard let url = urls.first else { return }
+                    guard let url = urls.first else {
+                        songPickerTarget = .newClip
+                        return
+                    }
                     importedURL = url
                     songPickerMode = .files
                 case .failure(let error):
+                    songPickerTarget = .newClip
                     guard !MusicCatalogService.isCancellation(error) else { return }
                     appModel.lastError = error.localizedDescription
                 }
@@ -4218,6 +4277,27 @@ private struct CustomClipsManagerSheet: View {
                     Button("Edit Clip") {
                         editingClip = clip
                     }
+                    // The only way to point a Custom Clip at different audio. Without
+                    // it a clip whose file or Apple Music access is gone could only be
+                    // deleted and recreated, losing its name and its position in the
+                    // live Clips grid.
+                    Menu("Replace Source") {
+                        Button {
+                            beginReplacingSource(for: clip, using: .musicLibrary)
+                        } label: {
+                            Label("Choose from Music Library", systemImage: "music.note.list")
+                        }
+                        Button {
+                            beginReplacingSource(for: clip, using: .appleMusic)
+                        } label: {
+                            Label("Search Apple Music", systemImage: "magnifyingglass")
+                        }
+                        Button {
+                            beginReplacingSource(for: clip, using: nil)
+                        } label: {
+                            Label("Import Audio or Video", systemImage: "square.and.arrow.down")
+                        }
+                    }
                     Button("Rename") {
                         renameText = clip.displayName ?? clip.playbackCue.rosterDisplayTitle
                         renamingClip = clip
@@ -4232,6 +4312,18 @@ private struct CustomClipsManagerSheet: View {
             }
         }
         .padding(.vertical, 4)
+    }
+
+    /// Points an existing Custom Clip at new audio. `mode` of `nil` means the file
+    /// importer, which sets `.files` itself once a document is chosen.
+    private func beginReplacingSource(for clip: SongClip, using mode: SongPickerMode?) {
+        songPickerTarget = .replaceSource(clipID: clip.id, name: clip.displayName ?? "")
+        notice = nil
+        if let mode {
+            songPickerMode = mode
+        } else {
+            showFileImporter = true
+        }
     }
 
     private func savePendingCue() {
@@ -5697,6 +5789,12 @@ private struct GameDayTeamStack: View {
         team.presentPlayersInBattingOrder
     }
 
+    /// Resolved once per render and shared by the hero, On Deck card and grid.
+    /// Each of those used to probe the filesystem per player independently.
+    private var availability: [UUID: GameDayPlayerAvailability] {
+        appModel.gameDayAvailability(for: presentPlayers)
+    }
+
     private var gameDayGridPlayers: [Player] {
         team.gameDayGridPlayers(startingAfter: onDeckPlayer?.id)
     }
@@ -5760,7 +5858,9 @@ private struct GameDayTeamStack: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
+        let availability = self.availability
+
+        return VStack(alignment: .leading, spacing: 12) {
             GameDayAnnouncerModePicker(
                 selectedMode: team.session.gameDayAnnouncerMode,
                 onSelect: appModel.setGameDayAnnouncerMode
@@ -5778,6 +5878,7 @@ private struct GameDayTeamStack: View {
                     titleLabel: nowBattingLabel,
                     isActive: isActive(displayedNowPlayer),
                     announcerMode: team.session.gameDayAnnouncerMode,
+                    availability: availability[displayedNowPlayer.id] ?? .unknown,
                     isLineupProgressFocused: lineupProgressFocus == .nowBatting(displayedNowPlayer.id)
                 )
             } else {
@@ -5788,10 +5889,11 @@ private struct GameDayTeamStack: View {
             }
 
             GameDayOnDeckCard(
-                appModel: appModel,
                 player: onDeckPlayer,
                 announcerMode: team.session.gameDayAnnouncerMode,
-                isLineupProgressFocused: onDeckPlayer.map { lineupProgressFocus == .onDeck($0.id) } ?? false
+                availability: onDeckPlayer.flatMap { availability[$0.id] } ?? .unknown,
+                isLineupProgressFocused: onDeckPlayer.map { lineupProgressFocus == .onDeck($0.id) } ?? false,
+                onAdvance: appModel.advanceNextBatterFromOnDeck
             )
 
             GameDayControlRow(
@@ -5808,6 +5910,7 @@ private struct GameDayTeamStack: View {
                 nowPlayerID: lineupNowPlayer?.id,
                 onDeckPlayerID: onDeckPlayer?.id,
                 announcerMode: team.session.gameDayAnnouncerMode,
+                availability: availability,
                 lineupProgressFocusedPlayerID: lineupProgressGridPlayerID
             )
         }
@@ -5865,15 +5968,6 @@ private struct GameDayTeamStack: View {
             return !appModel.state.settings.fadeOutVolumeAutomationEnabled
         }
         return [.audioRoute, .network, .appleMusicAccess, .lineup].contains(check.category)
-    }
-
-    private func willUseFallback(for player: Player) -> Bool {
-        switch team.session.gameDayAnnouncerMode {
-        case .announcerOnly:
-            return !appModel.hasStoredCustomAnnouncer(for: player)
-        case .announcerAndSong, .songOnly:
-            return team.cue(for: player) == nil
-        }
     }
 
     private func role(for state: ReadinessState) -> StatusChipRole {
@@ -5986,6 +6080,7 @@ private struct GameDayNowBattingHero: View {
     let titleLabel: String
     let isActive: Bool
     let announcerMode: GameDayAnnouncerMode
+    let availability: GameDayPlayerAvailability
     let isLineupProgressFocused: Bool
 
     @Environment(\.colorScheme) private var colorScheme
@@ -6005,20 +6100,18 @@ private struct GameDayNowBattingHero: View {
     }
 
     private var cueTitleShowsMusicIcon: Bool {
-        announcerMode != .announcerOnly && !willUseFallback && appModel.resolvedCue(for: player) != nil
+        announcerMode != .announcerOnly && !willUseFallback && availability.hasPlayableSong
     }
 
     private var hasCustomAnnouncer: Bool {
-        appModel.hasStoredCustomAnnouncer(for: player)
+        availability.hasAnnouncement
     }
 
     private var willUseFallback: Bool {
-        switch announcerMode {
-        case .announcerOnly:
-            return !hasCustomAnnouncer
-        case .announcerAndSong, .songOnly:
-            return appModel.playerWillUseFallback(for: player) || (isActive && appModel.isPlayingFallback(for: player))
-        }
+        // Media availability comes from the shared per-render snapshot; only the
+        // "already playing a fallback" case needs live playback state.
+        availability.willUseFallback(in: announcerMode)
+            || (isActive && appModel.isPlayingFallback(for: player))
     }
 
     private var statusText: String {
@@ -6041,7 +6134,7 @@ private struct GameDayNowBattingHero: View {
     }
 
     private var cueIcons: [GameDayTileCueIcon] {
-        let hasSong = appModel.resolvedCue(for: player) != nil && !willUseFallback
+        let hasSong = availability.hasPlayableSong && !willUseFallback
         let availableColor = Color.rollCall(.ready, surface: .live)
         let missingColor = Color.rollCall(.destructive, surface: .live)
 
@@ -6190,16 +6283,6 @@ private struct GameDayNowBattingHero: View {
         "\(titleLabel), \(player.displayName), \(statusText), \(cueTitle), \(isActive ? "tap again to stop" : actionTitle)"
     }
 
-    private var cueIconRow: some View {
-        HStack(spacing: 6) {
-            ForEach(cueIcons) { icon in
-                Image(systemName: icon.systemImage)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(icon.color)
-            }
-        }
-    }
-
     private var isCurrentlyActive: Bool {
         if let cueID = appModel.resolvedCue(for: player)?.id {
             return appModel.playbackEngine.activeCueID == cueID
@@ -6246,10 +6329,11 @@ private struct GameDayNowBattingHero: View {
 }
 
 private struct GameDayOnDeckCard: View {
-    @ObservedObject var appModel: AppModel
     let player: Player?
     let announcerMode: GameDayAnnouncerMode
+    let availability: GameDayPlayerAvailability
     let isLineupProgressFocused: Bool
+    let onAdvance: () -> Void
 
     @Environment(\.colorScheme) private var colorScheme
     @Environment(\.rollCallTeamAccentTheme) private var teamAccentTheme
@@ -6258,7 +6342,7 @@ private struct GameDayOnDeckCard: View {
         Group {
             if player != nil {
                 Button {
-                    appModel.advanceNextBatterFromOnDeck()
+                    onAdvance()
                 } label: {
                     content
                 }
@@ -6346,8 +6430,11 @@ private struct GameDayOnDeckCard: View {
     }
 
     private func onDeckCueIcons(for player: Player) -> [GameDayTileCueIcon] {
-        let hasCustomAnnouncer = appModel.hasStoredCustomAnnouncer(for: player)
-        let hasSong = appModel.resolvedCue(for: player) != nil
+        // Previously `resolvedCue(for:) != nil`, which showed a green note for a
+        // player whose audio file was missing while the grid showed a slashed note
+        // for the same player in the same frame. Both now read one snapshot.
+        let hasCustomAnnouncer = availability.hasAnnouncement
+        let hasSong = availability.hasPlayableSong
         let availableColor = Color.rollCall(.ready, surface: .live)
         let missingColor = Color.rollCall(.destructive, surface: .live)
 
@@ -6398,16 +6485,6 @@ private struct GameDayOnDeckCard: View {
         return liveAccentOutlineColor(theme: teamAccentTheme, colorScheme: colorScheme, lightOpacity: 0.8, darkOpacity: 0.4)
     }
 
-    @ViewBuilder
-    private func onDeckCueIconRow(for player: Player) -> some View {
-        HStack(spacing: 6) {
-            ForEach(onDeckCueIcons(for: player)) { icon in
-                Image(systemName: icon.systemImage)
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(icon.color)
-            }
-        }
-    }
 }
 
 private struct GameDayAnnouncerModePicker: View {
@@ -6565,6 +6642,7 @@ private struct GameDayPlayerGrid: View {
     let nowPlayerID: UUID?
     let onDeckPlayerID: UUID?
     let announcerMode: GameDayAnnouncerMode
+    let availability: [UUID: GameDayPlayerAvailability]
     let lineupProgressFocusedPlayerID: UUID?
 
     @Environment(\.colorScheme) private var colorScheme
@@ -6577,6 +6655,7 @@ private struct GameDayPlayerGrid: View {
         nowPlayerID: UUID?,
         onDeckPlayerID: UUID?,
         announcerMode: GameDayAnnouncerMode,
+        availability: [UUID: GameDayPlayerAvailability],
         lineupProgressFocusedPlayerID: UUID?
     ) {
         self.appModel = appModel
@@ -6585,6 +6664,7 @@ private struct GameDayPlayerGrid: View {
         self.nowPlayerID = nowPlayerID
         self.onDeckPlayerID = onDeckPlayerID
         self.announcerMode = announcerMode
+        self.availability = availability
         self.lineupProgressFocusedPlayerID = lineupProgressFocusedPlayerID
         _playbackEngine = ObservedObject(initialValue: appModel.playbackEngine)
     }
@@ -6697,8 +6777,8 @@ private struct GameDayPlayerGrid: View {
     }
 
     private func tileCueIcons(for player: Player) -> [GameDayTileCueIcon] {
-        let hasAnnouncer = appModel.hasStoredCustomAnnouncer(for: player)
-        let hasSong = appModel.resolvedCue(for: player) != nil && !willUseFallback(for: player)
+        let hasAnnouncer = availability(for: player).hasAnnouncement
+        let hasSong = availability(for: player).hasPlayableSong && !willUseFallback(for: player)
         let availableColor = Color(uiColor: .secondaryLabel)
         let missingColor = Color(uiColor: .tertiaryLabel)
 
@@ -6757,13 +6837,15 @@ private struct GameDayPlayerGrid: View {
         }
     }
 
+    private func availability(for player: Player) -> GameDayPlayerAvailability {
+        availability[player.id] ?? .unknown
+    }
+
     private func willUseFallback(for player: Player) -> Bool {
-        switch announcerMode {
-        case .announcerOnly:
-            return !appModel.hasStoredCustomAnnouncer(for: player)
-        case .announcerAndSong, .songOnly:
-            return appModel.playerWillUseFallback(for: player) || appModel.isPlayingFallback(for: player)
-        }
+        // Media availability from the shared per-render snapshot; only the
+        // "already playing a fallback" case needs live playback state.
+        availability(for: player).willUseFallback(in: announcerMode)
+            || appModel.isPlayingFallback(for: player)
     }
 
     private func tileAccessibilityLabel(for player: Player, tileState: GameDayTileState?) -> String {
@@ -8050,6 +8132,13 @@ private struct PlayerEditorSheet: View {
         var id: String { rawValue }
     }
 
+    private struct PhotoFramingPresentation: Identifiable {
+        let id = UUID()
+        let target: PhotoFramingTarget
+        let image: UIImage
+        let options: PlayerPhotoFramingOptionSet
+    }
+
     private struct SongReadinessExplanation: Identifiable {
         let id: String
         let title: String
@@ -8068,8 +8157,8 @@ private struct PlayerEditorSheet: View {
     @State var player: Player
     @State private var photoItem: PhotosPickerItem?
     @State private var isPreparingPhoto = false
-    @State private var photoFramingTarget: PhotoFramingTarget?
-    @State private var photoFramingImage: UIImage?
+    @State private var photoFramingPresentation: PhotoFramingPresentation?
+    @State private var photoFramingRequestID: UUID?
     @State private var playerCardPreviewPresented = false
     @State private var pendingPhotoDetectionResult: PlayerPhotoDetectionResult?
     @State private var didAdjustProfileFraming = false
@@ -8378,6 +8467,7 @@ private struct PlayerEditorSheet: View {
                 }
             }
             .onDisappear {
+                photoFramingRequestID = nil
                 if appModel.isRecordingCustomAnnouncer(for: player) {
                     appModel.cancelRecordingCustomAnnouncer()
                 }
@@ -8481,10 +8571,8 @@ private struct PlayerEditorSheet: View {
                     )
                 }
             }
-            .fullScreenCover(item: $photoFramingTarget) { target in
-                if let photoFramingImage {
-                    photoFramingEditor(for: target, image: photoFramingImage)
-                }
+            .fullScreenCover(item: $photoFramingPresentation) { presentation in
+                photoFramingEditor(for: presentation)
             }
         }
     }
@@ -8771,8 +8859,19 @@ private struct PlayerEditorSheet: View {
             player.profilePhotoCrop = nil
             player.playerCardPhotoCrop = nil
         }
-        photoFramingImage = image
-        photoFramingTarget = target
+        let requestID = UUID()
+        photoFramingRequestID = requestID
+        Task {
+            let options = await PlayerPhotoPreparationService().framingOptions(for: image)
+            await MainActor.run {
+                guard photoFramingRequestID == requestID else { return }
+                photoFramingPresentation = PhotoFramingPresentation(
+                    target: target,
+                    image: image,
+                    options: options
+                )
+            }
+        }
     }
 
     private func framingCrop(for target: PhotoFramingTarget, image: UIImage) -> NormalizedPhotoCrop {
@@ -8789,23 +8888,25 @@ private struct PlayerEditorSheet: View {
         }
     }
 
-    private func photoFramingEditor(for target: PhotoFramingTarget, image: UIImage) -> some View {
+    private func photoFramingEditor(for presentation: PhotoFramingPresentation) -> some View {
+        let target = presentation.target
+        let image = presentation.image
         let aspectRatio = target == .profile ? 1.0 : PlayerPhotoFramingGeometry.playerCardPhotoAspectRatio
         let title = target == .profile ? "Adjust Profile Photo" : "Adjust Player Card Photo"
+        let options = target == .profile ? presentation.options.profile : presentation.options.card
 
         return PhotoFramingEditorSheet(
             image: image,
             initialCrop: framingCrop(for: target, image: image),
             aspectRatio: aspectRatio,
+            framingOptions: options,
             title: title,
             onCancel: {
-                photoFramingTarget = nil
-                photoFramingImage = nil
+                photoFramingPresentation = nil
             },
             onApply: { crop in
                 applyPhotoFraming(crop, target: target, image: image)
-                photoFramingTarget = nil
-                photoFramingImage = nil
+                photoFramingPresentation = nil
             }
         )
     }

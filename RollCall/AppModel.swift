@@ -491,6 +491,26 @@ struct PlayerSongsToCustomClipsResult: Equatable {
     var skippedCount: Int
 }
 
+/// One player's Game Day media availability, resolved once per render pass by
+/// `AppModel.gameDayAvailability(for:)` and shared by every live surface.
+struct GameDayPlayerAvailability: Equatable {
+    var hasAnnouncement: Bool
+    var hasPlayableSong: Bool
+
+    static let unknown = GameDayPlayerAvailability(hasAnnouncement: false, hasPlayableSong: false)
+
+    /// Whether Game Day will substitute the generic cheer for this player.
+    /// Playback state (an *already playing* fallback) is tracked separately.
+    func willUseFallback(in mode: GameDayAnnouncerMode) -> Bool {
+        switch mode {
+        case .announcerOnly:
+            return !hasAnnouncement
+        case .announcerAndSong, .songOnly:
+            return !hasPlayableSong
+        }
+    }
+}
+
 @MainActor
 final class AppModel: ObservableObject {
     // Central default so a future settings UI can replace this with user selection.
@@ -1800,7 +1820,11 @@ final class AppModel: ObservableObject {
             } else {
                 try await playbackEngine.play(
                     cue: cue,
-                    fadeOutVolumeAutomationEnabled: state.settings.fadeOutVolumeAutomationEnabled
+                    fadeOutVolumeAutomationEnabled: state.settings.fadeOutVolumeAutomationEnabled,
+                    // The clip editor draws a playhead over the song window, and is
+                    // the only surface that reads `activeCueProgress`. Game Day does
+                    // not, so live cues leave progress tracking off entirely.
+                    tracksProgress: true
                 )
             }
             guard isCurrentPlaybackRequest(requestID) else { return }
@@ -3018,6 +3042,28 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Resolves every present player's cue and announcement availability in a single
+    /// pass, so a Game Day render does two `FileManager` probes per player instead of
+    /// two per player *per subview*. The hero, On Deck card and grid all used to
+    /// recompute this independently, each hitting the disk from `body`.
+    ///
+    /// Sharing one snapshot also removes a real inconsistency: the On Deck card
+    /// treated "has a cue" as "has a song", while the hero and grid required the cue
+    /// to be *playable*, so the same player could show a green note On Deck and a
+    /// slashed note in the grid in the same frame.
+    func gameDayAvailability(for players: [Player]) -> [UUID: GameDayPlayerAvailability] {
+        var availability: [UUID: GameDayPlayerAvailability] = [:]
+        availability.reserveCapacity(players.count)
+        for player in players {
+            let playableCue = resolvedCue(for: player).flatMap { cueIsPlayable($0) ? $0 : nil }
+            availability[player.id] = GameDayPlayerAvailability(
+                hasAnnouncement: hasStoredCustomAnnouncer(for: player),
+                hasPlayableSong: playableCue != nil
+            )
+        }
+        return availability
+    }
+
     func isPlayingFallback(for player: Player) -> Bool {
         activeFallbackPlayerID == player.id && playbackEngine.activeCueID == playbackID(for: player)
     }
@@ -3128,6 +3174,12 @@ final class AppModel: ObservableObject {
 
         state.teams[teamIndex].modifiedAt = .now
         removeAssetsNoLongerReferenced(from: previousPlayer, to: updatedPlayer)
+        // `removeAssetsNoLongerReferenced` only *stages* paths into
+        // `pendingAssetCleanupPaths`; the files are deleted in
+        // `applyPersistenceResult` once a write lands. Without this persist the
+        // roster change is unsaved and the superseded announcer file leaks. Any
+        // mutation that stages cleanup must persist, not rely on its caller.
+        persist()
     }
 
     private func removeAssetIfUnreferenced(relativePath: String) {
@@ -3167,21 +3219,66 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func assetIsReferencedByBackupSnapshot(relativePath: String) -> Bool {
+    /// The union of every asset path referenced by a stored backup, resolved once
+    /// per distinct set of snapshot records.
+    ///
+    /// Snapshot files are written once under a UUID filename and never mutated, and
+    /// the record list changes whenever one is created or pruned, so the record ids
+    /// are a sound cache key.
+    private struct SnapshotAssetReferences {
+        var snapshotIDs: [UUID]
+        var referencedPaths: Set<String>
+        /// A snapshot we could not read means we cannot prove *anything* is
+        /// unreferenced, so every path has to be treated as referenced. This
+        /// preserves the original fail-closed behaviour exactly.
+        var hasUnreadableSnapshot: Bool
+    }
+
+    private var snapshotAssetReferences: SnapshotAssetReferences?
+
+    private func resolvedSnapshotAssetReferences() -> SnapshotAssetReferences {
+        let snapshotIDs = state.snapshots.map(\.id)
+        if let cached = snapshotAssetReferences, cached.snapshotIDs == snapshotIDs {
+            return cached
+        }
+
         let decoder = JSONDecoder()
         decoder.dateDecodingStrategy = .iso8601
+        var referencedPaths: Set<String> = []
+        var hasUnreadableSnapshot = false
+
         for snapshot in state.snapshots {
             do {
                 let snapshotURL = try backupSnapshotURL(for: snapshot)
                 let snapshotState = try decoder.decode(AppState.self, from: Data(contentsOf: snapshotURL))
-                if snapshotState.teams.contains(where: { storedAssetRelativePaths(for: $0).contains(relativePath) }) {
-                    return true
+                for team in snapshotState.teams {
+                    referencedPaths.formUnion(storedAssetRelativePaths(for: team))
                 }
             } catch {
-                return true
+                hasUnreadableSnapshot = true
+                break
             }
         }
-        return false
+
+        let resolved = SnapshotAssetReferences(
+            snapshotIDs: snapshotIDs,
+            referencedPaths: referencedPaths,
+            hasUnreadableSnapshot: hasUnreadableSnapshot
+        )
+        snapshotAssetReferences = resolved
+        return resolved
+    }
+
+    /// This used to decode every backup snapshot — up to ten complete `AppState`
+    /// documents — from disk, synchronously on the main actor, **once per asset
+    /// path**. It runs from `removeAssetIfUnreferenced`, which is called on every
+    /// player save, custom-clip edit, clip-preparation outcome and Recently Deleted
+    /// purge, so replacing a single photo could mean twenty full decodes while the
+    /// UI was blocked. The work is now done once per change to the snapshot set.
+    private func assetIsReferencedByBackupSnapshot(relativePath: String) -> Bool {
+        let references = resolvedSnapshotAssetReferences()
+        guard !references.hasUnreadableSnapshot else { return true }
+        return references.referencedPaths.contains(relativePath)
     }
 
     private func backupSnapshotURL(for snapshot: SnapshotRecord) throws -> URL {
@@ -3998,29 +4095,36 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// Writes the newest state and does not return until it has landed.
+    ///
+    /// There is deliberately **no watchdog here.** This previously raced the write
+    /// against a one-second `Task.sleep` in a task group and called `cancelAll()`
+    /// on whichever lost. Under main-actor contention the write — which has to hop
+    /// to the main actor to build its request — could be starved past that second
+    /// and then cancelled *before it ever ran*, so the flush returned having
+    /// silently persisted nothing.
+    ///
+    /// The only caller is scene-phase backgrounding in `RootView`, which invokes
+    /// this from a detached `Task` and never awaits it. The timeout therefore
+    /// protected nothing — it could not stall the UI or the scene transition — while
+    /// its only observable effect was dropping the final save. The work it bounds is
+    /// one atomic file write on a serial actor, with no network or external locks.
     func flushLatestState() async {
-        await withTaskGroup(of: Void.self) { group in
-            group.addTask { [weak self] in
-                guard let self else { return }
-                await self.persistLatestStateAndWait()
-            }
-            group.addTask {
-                try? await Task.sleep(for: .seconds(1))
-            }
-            await group.next()
-            group.cancelAll()
-        }
+        await persistLatestStateAndWait()
     }
 
     private func makePersistenceRequest() -> PersistenceRequest? {
         let snapshot = state
+        // Copy rather than drain. Every path is re-validated against the current
+        // state before deletion, so carrying a path across more than one write is
+        // harmless — whereas draining it here meant a superseded write discarded it
+        // permanently. Paths are cleared in `applyPersistenceResult` once a write
+        // actually lands.
         let cleanupPaths = pendingAssetCleanupPaths
-        pendingAssetCleanupPaths.removeAll()
         let destinationURL: URL
         do {
             destinationURL = try AppPaths.stateURL()
         } catch {
-            pendingAssetCleanupPaths.formUnion(cleanupPaths)
             lastError = error.localizedDescription
             return nil
         }
@@ -4050,12 +4154,21 @@ final class AppModel: ObservableObject {
     ) {
         switch result {
         case .written(let sequence):
+            // Cleanup runs for any write that landed, not only the newest one.
+            // `removePersistedAssetIfStillUnreferenced` re-checks the current state
+            // and every backup snapshot before touching a file, so a superseded
+            // write cannot delete something a later state re-referenced. Gating
+            // this on `sequence >= latestRequestedPersistenceSequence` instead meant
+            // that whenever a second persist raced the first — the common case, since
+            // most mutations persist two or three times in a row — the staged paths
+            // were dropped on the floor and the files leaked forever.
+            pendingAssetCleanupPaths.subtract(cleanupPaths)
+            cleanupPaths.forEach(removePersistedAssetIfStillUnreferenced)
             guard sequence >= latestRequestedPersistenceSequence else { return }
             latestDurablePersistenceSequence = sequence
             statePersistenceFailureEpisodeActive = false
-            cleanupPaths.forEach(removePersistedAssetIfStillUnreferenced)
         case .failed(let sequence, let errorDescription):
-            pendingAssetCleanupPaths.formUnion(cleanupPaths)
+            // Paths were never drained, so they remain staged for the next write.
             lastError = errorDescription
             guard StatePersistenceFailureSemantics.shouldReportFailure(
                 failedSequence: sequence,
@@ -4066,7 +4179,8 @@ final class AppModel: ObservableObject {
                 telemetry.record(.statePersistenceFailed)
             }
         case .unconfirmed:
-            pendingAssetCleanupPaths.formUnion(cleanupPaths)
+            // Same: still staged, nothing to restore.
+            break
         }
     }
 
@@ -4494,15 +4608,7 @@ final class AppModel: ObservableObject {
     }
 
     private func playbackSourceFamily(for cue: Cue) -> PlaybackSourceFamily {
-        switch cue.source {
-        case .appleMusic(let source):
-            if source.libraryPersistentID != nil, source.isCatalogBacked == false { return .musicLibrary }
-            return source.isCatalogBacked == false ? .appleMusicPreview : .appleMusicCatalog
-        case .localAudio:
-            return .importedLocal
-        case .builtInClip:
-            return .builtin
-        }
+        cue.source.playbackSourceFamily
     }
 
     private func playerPlaybackSourceFamily(player: Player, cue: Cue) -> PlaybackSourceFamily {

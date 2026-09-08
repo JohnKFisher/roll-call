@@ -1438,9 +1438,11 @@ extension Team {
     func orderedPlayers(by ids: [UUID]) -> [Player] {
         let lookup = Dictionary(players.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         let ordered = ids.compactMap { lookup[$0] }
-        let unordered = players.filter { player in
-            !ids.contains(player.id)
-        }
+        // Set membership, not `ids.contains` — this runs on every Game Day render
+        // path via `presentPlayersInBattingOrder`, and the linear scan made it
+        // O(roster x lineup).
+        let orderedIDs = Set(ids)
+        let unordered = players.filter { !orderedIDs.contains($0.id) }
         return ordered + unordered
     }
 

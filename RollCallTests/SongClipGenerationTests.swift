@@ -1,4 +1,5 @@
 import AVFoundation
+import MediaPlayer
 import UIKit
 import XCTest
 @testable import RollCall
@@ -861,8 +862,16 @@ final class SongClipGenerationTests: XCTestCase {
         XCTAssertFalse(appleMusicSource.runtimeVolumeAutomationEnabled(whenSettingEnabled: false))
     }
 
+    /// The fallback chain in `AGENTS.md` ends at "generic cheering fallback", so a
+    /// playback failure on *any* player-specific source — Apple Music or imported
+    /// local audio — must still reach the built-in cheer. Only a failed built-in
+    /// cue returns nil, because there is nothing further to fall back to and
+    /// retrying Small Cheer with Small Cheer would loop.
+    ///
+    /// This previously asserted that a failed local cue produced no fallback,
+    /// which would have left Game Day silent — the outcome the invariant forbids.
     @MainActor
-    func testAppleMusicPlaybackFailureUsesNoSongFallbackCue() throws {
+    func testPlaybackFailureFallsBackToBuiltInCheerForEveryPlayerSource() throws {
         let appleMusicCue = RollCallTestFixtures.appleMusicCue(
             songID: "apple-music-unavailable",
             title: "Unavailable Song",
@@ -888,11 +897,142 @@ final class SongClipGenerationTests: XCTestCase {
             return XCTFail("Expected Apple Music playback failure to resolve to the built-in fallback cue.")
         }
         XCTAssertEqual(source.id, "small-cheer")
+
+        // Imported local audio that fails must also reach the cheer fallback.
+        let failedLocalCue = RollCallTestFixtures.localCue()
+        let localFallback = try XCTUnwrap(
+            model.fallbackCueAfterPlaybackFailure(for: loadedPlayer, failedCue: failedLocalCue),
+            "A failed local cue must still fall back to the built-in cheer, not go silent."
+        )
+        XCTAssertEqual(localFallback.id, failedLocalCue.id)
+        guard case .builtInClip(let localFallbackSource) = localFallback.source else {
+            return XCTFail("Expected local playback failure to resolve to the built-in fallback cue.")
+        }
+        XCTAssertEqual(localFallbackSource.id, "small-cheer")
+
+        // A built-in cue that fails has nothing further to fall back to.
         XCTAssertNil(
             model.fallbackCueAfterPlaybackFailure(
                 for: loadedPlayer,
-                failedCue: RollCallTestFixtures.localCue()
+                failedCue: fallbackCue
             )
+        )
+    }
+
+    /// Volume Automation fades Apple Music through `MPMusicPlayerController`'s
+    /// `volume` setter. That property is public and still shipping, but was
+    /// deprecated in iOS 7 — before this app's iOS 17 floor — so Swift imports it as
+    /// unavailable and it can only be reached by KVC. `setPlayerVolume` probes for
+    /// the selector first so that if Apple ever removes it the feature degrades to a
+    /// no-op instead of raising an uncatchable `NSUnknownKeyException` mid-cue.
+    ///
+    /// This test asserts the probe still finds it. If this ever fails, Volume
+    /// Automation has silently stopped working and needs a real replacement
+    /// (`MPVolumeView`) rather than a louder guard.
+    func testDeprecatedMusicPlayerVolumeSetterIsStillAvailableForVolumeAutomation() {
+        XCTAssertTrue(
+            MPMusicPlayerController.instancesRespond(to: NSSelectorFromString("setVolume:")),
+            "Volume Automation is now a silent no-op for Apple Music cues."
+        )
+    }
+
+    /// Progress publishes at 20 Hz and republishes the whole `CuePlaybackEngine`,
+    /// rebuilding every Game Day view that observes it. Only the clip editor reads
+    /// `activeCueProgress`, so a live Game Day cue must not turn the tracker on.
+    @MainActor
+    func testLiveCuePublishesNoProgressWhileClipEditorPreviewDoes() async throws {
+        // `writeAsset` writes the literal bytes "test"; AVAudioPlayer needs real audio.
+        try writeSilentAudio(to: try AppPaths.assetURL(relativePath: "progress.caf"), duration: 2)
+        let engine = CuePlaybackEngine(
+            audioAssetService: AudioAssetService(),
+            musicCatalogService: MusicCatalogService()
+        )
+        // Distinct ids so the engine's 0.45s same-cue debounce does not swallow the
+        // second play.
+        var liveCue = RollCallTestFixtures.localCue(relativePath: "progress.caf")
+        liveCue.id = UUID()
+        var previewCue = liveCue
+        previewCue.id = UUID()
+
+        // Game Day path: no `tracksProgress`, so nothing is published.
+        _ = try await engine.play(cue: liveCue, fadeOutVolumeAutomationEnabled: false)
+        XCTAssertNil(engine.activeCueProgress, "Live Game Day playback must not drive the 20 Hz progress tracker.")
+        engine.stop()
+
+        // Clip editor preview path: opts in explicitly.
+        _ = try await engine.play(cue: previewCue, fadeOutVolumeAutomationEnabled: false, tracksProgress: true)
+        XCTAssertNotNil(engine.activeCueProgress, "The clip editor still needs its playhead.")
+        engine.stop()
+        XCTAssertNil(engine.activeCueProgress)
+    }
+
+    /// Backs the Custom Clip "Replace Source" action added for H4. A clip whose
+    /// audio is gone previously had no way to be pointed at new audio — the only
+    /// recovery was delete and recreate, losing the clip's name and its position in
+    /// the live Clips grid, both of which the user arranged deliberately.
+    @MainActor
+    func testReplacingCustomClipSourceKeepsNameAndPositionAndRestoresPlayback() async throws {
+        var brokenClip = SongClip(cue: RollCallTestFixtures.localCue(relativePath: "gone.m4a"))
+        brokenClip.id = UUID()
+        brokenClip.displayName = "Rally Song"
+        // A stale generated asset from before the source went missing.
+        brokenClip.generatedAsset = GeneratedClipAsset(
+            relativePath: "GeneratedClips/stale.m4a",
+            status: .ready,
+            renderedSelection: brokenClip.requestedSelection,
+            generationKey: brokenClip.generationKey,
+            generatedAt: RollCallTestFixtures.now
+        )
+
+        var firstClip = SongClip(cue: RollCallTestFixtures.localCue(relativePath: "first.caf"))
+        firstClip.id = UUID()
+        firstClip.displayName = "First"
+        var lastClip = SongClip(cue: RollCallTestFixtures.localCue(relativePath: "last.caf"))
+        lastClip.id = UUID()
+        lastClip.displayName = "Last"
+
+        var team = RollCallTestFixtures.team()
+        team.teamClips = [firstClip, brokenClip, lastClip]
+        try writeState(RollCallTestFixtures.appState(team: team))
+        try writeSilentAudio(to: try AppPaths.assetURL(relativePath: "first.caf"), duration: 1)
+        try writeSilentAudio(to: try AppPaths.assetURL(relativePath: "last.caf"), duration: 1)
+        // "gone.m4a" is deliberately never written — this is the broken clip.
+        try writeSilentAudio(to: try AppPaths.assetURL(relativePath: "replacement.caf"), duration: 1)
+
+        let model = AppModel()
+        let stored = try XCTUnwrap(model.selectedTeam?.teamClips[1])
+        XCTAssertEqual(stored.id, brokenClip.id)
+        XCTAssertFalse(model.customClipCanPlay(stored), "Fixture should start unplayable.")
+
+        // What the Replace Source flow ultimately calls.
+        let replacement = Cue.localDefault(
+            source: LocalAudioSource(
+                id: UUID(),
+                displayName: "Replacement Audio",
+                relativePath: "replacement.caf",
+                duration: 1,
+                importedAt: RollCallTestFixtures.now,
+                hiddenOriginNote: nil
+            )
+        )
+        model.updateCustomClip(brokenClip.id, with: replacement, named: stored.displayName ?? "")
+        await model.flushLatestState()
+
+        let clips = try XCTUnwrap(model.selectedTeam?.teamClips)
+        XCTAssertEqual(clips.count, 3)
+        XCTAssertEqual(clips[1].id, brokenClip.id, "Replacing the source must not move the clip in the grid.")
+        XCTAssertEqual(clips.map(\.displayName), ["First", "Rally Song", "Last"], "The clip's name must survive.")
+
+        let replaced = clips[1]
+        guard case .localAudio(let source) = replaced.originalSource else {
+            return XCTFail("Expected the replacement local source.")
+        }
+        XCTAssertEqual(source.relativePath, "replacement.caf")
+        XCTAssertTrue(model.customClipCanPlay(replaced), "The clip must be playable again.")
+        XCTAssertNotEqual(
+            replaced.generatedAsset.relativePath,
+            "GeneratedClips/stale.m4a",
+            "A new source changes the generation key, so the stale generated asset must be dropped."
         )
     }
 

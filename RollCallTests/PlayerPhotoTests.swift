@@ -68,6 +68,35 @@ final class PlayerPhotoTests: XCTestCase {
         XCTAssertLessThan(analysis.profileCrop.height, analysis.cardCrop.height)
     }
 
+    func testAutomaticCardFramingPrefersUpperBodyWhenFullBodyIsAvailable() {
+        let imageSize = CGSize(width: 1_600, height: 1_200)
+        let options = PlayerPhotoFramingGeometry.framingOptions(
+            faces: [CGRect(x: 0.46, y: 0.1, width: 0.08, height: 0.1)],
+            people: [CGRect(x: 0.3, y: 0.08, width: 0.4, height: 0.86)],
+            upperBodies: [CGRect(x: 0.32, y: 0.08, width: 0.36, height: 0.48)],
+            imageSize: imageSize
+        )
+
+        let automatic = try! XCTUnwrap(options.card[.automatic])
+        let fullBody = try! XCTUnwrap(options.card[.fullBody])
+
+        assertPhysicalAspect(automatic, imageSize: imageSize, expected: PlayerPhotoFramingGeometry.playerCardPhotoAspectRatio)
+        XCTAssertLessThan(automatic.cgRect.height, fullBody.cgRect.height)
+        XCTAssertGreaterThan(automatic.cgRect.midY, 0.25)
+    }
+
+    func testFramingOptionsExposeAllTestingModesForBothTargets() {
+        let options = PlayerPhotoFramingGeometry.framingOptions(
+            faces: [CGRect(x: 0.4, y: 0.12, width: 0.2, height: 0.16)],
+            people: [CGRect(x: 0.25, y: 0.08, width: 0.5, height: 0.84)],
+            upperBodies: [CGRect(x: 0.28, y: 0.08, width: 0.44, height: 0.5)],
+            imageSize: CGSize(width: 1_200, height: 1_600)
+        )
+
+        XCTAssertEqual(Set(options.profile.keys), Set(PlayerPhotoFramingMode.allCases))
+        XCTAssertEqual(Set(options.card.keys), Set(PlayerPhotoFramingMode.allCases))
+    }
+
     func testMultiplePeopleFavorLargeCentralSubject() {
         let imageSize = CGSize(width: 1_000, height: 1_500)
         let analysis = PlayerPhotoFramingGeometry.analyze(
@@ -134,6 +163,37 @@ final class PlayerPhotoTests: XCTestCase {
         assertPhysicalAspect(tallCrop, imageSize: tall, expected: PlayerPhotoFramingGeometry.playerCardPhotoAspectRatio)
         XCTAssertEqual(panoramaCrop.cgRect.midX, 0.5, accuracy: 0.001)
         XCTAssertEqual(tallCrop.cgRect.midY, 0.5, accuracy: 0.001)
+    }
+
+    /// Regression guard for the degenerate-anchor bug: `centeredCrop` returned a
+    /// zero-area rect for *every* image, so any player without a stored crop —
+    /// i.e. every photo added before 1.3 — framed a 1% sliver of their photo.
+    /// Extreme aspect ratios are covered above; this covers the ordinary shapes
+    /// real player photos actually have, for both the card and profile aspects.
+    func testCenteredCropCoversMostOfAnOrdinaryPhoto() {
+        let sizes = [
+            CGSize(width: 1_000, height: 1_500),
+            CGSize(width: 1_200, height: 1_600),
+            CGSize(width: 3_024, height: 4_032),
+            CGSize(width: 500, height: 500)
+        ]
+        let aspects = [PlayerPhotoFramingGeometry.playerCardPhotoAspectRatio, 1.0]
+
+        for size in sizes {
+            for aspect in aspects {
+                let crop = PlayerPhotoFramingGeometry.centeredCrop(aspectRatio: aspect, imageSize: size)
+                let rect = crop.cgRect
+
+                assertPhysicalAspect(crop, imageSize: size, expected: aspect)
+                XCTAssertEqual(rect.midX, 0.5, accuracy: 0.001, "\(size) @ \(aspect)")
+                XCTAssertEqual(rect.midY, 0.5, accuracy: 0.001, "\(size) @ \(aspect)")
+                // A correct centred crop always spans one axis completely.
+                XCTAssertEqual(max(rect.width, rect.height), 1, accuracy: 0.001, "\(size) @ \(aspect)")
+                XCTAssertGreaterThan(rect.width * rect.height, 0.4, "\(size) @ \(aspect) framed a degenerate sliver")
+                // `clamped()` must not have to rescue the value.
+                XCTAssertEqual(crop.clamped().cgRect, rect)
+            }
+        }
     }
 
     func testPreparationNormalizesOrientationAndBoundsMaster() async throws {

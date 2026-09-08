@@ -218,6 +218,7 @@ struct RollCallTelemetryValidator {
         allow([.playbackFailedCompletely], [.sourceFamily, .liveContext, .fallbackAttempted, .reason])
         allow([.gameCompletePlaybackFailureObserved], [.sourceFamily, .reason])
         allow([.packageImportFailed, .csvImportFailed], [.reason])
+        allow([.stateRecoveryTriggered], [.reason])
         allow([.musicAccessDenied, .microphoneAccessDenied], [.result])
         allow([.playerCardGenerationFailed, .quickGameDayFallback, .quickGameDayFailed], [.reason])
         allow([.playerPhotoDetectionCompleted], [.detection])
@@ -251,6 +252,8 @@ struct RollCallTelemetryValidator {
         "game.completePlaybackFailureObserved.sourceFamily": ["recordedAnnouncement", "musicLibrary", "appleMusicCatalog", "appleMusicPreview", "generatedLocal", "importedLocal", "builtin", "unknown"],
         "packageImport.failed.reason": ["unsupportedVersion", "invalidPackage", "operationFailed"],
         "csvImport.failed.reason": ["invalidCSV", "operationFailed"],
+        // Both values come from `AppModel.loadInitialState()`.
+        "state.recoveryTriggered.reason": ["unsupportedSchema", "loadFailure"],
         "playerCard.generationFailed.reason": ["missingAsset", "unreadableImage", "encodingFailed", "unknown"],
         "quickGameDay.fallback.reason": ["noTeams", "noRememberedTeam", "rememberedTeamMissing", "explicitTeamMissing"],
         "quickGameDay.failed.reason": ["operationFailed", "unknown"],
@@ -1072,14 +1075,18 @@ final class RollCallTelemetryCoordinator {
     }
 
     private func mediaAssignmentEvent(for source: SongSource) -> RollCallTelemetryEvent? {
-        switch source {
-        case .appleMusic(let source) where source.libraryPersistentID != nil && source.isCatalogBacked == false:
+        // Derived from the one shared classifier so this milestone cannot drift from
+        // how playback and recovery report the same cue. It used to carry its own
+        // copy of the predicate, which made `.mediaFirstAssignedMusicLibrary`
+        // unreachable — Music Library picks were all counted as catalog assignments.
+        switch source.cueSource.playbackSourceFamily {
+        case .musicLibrary:
             return .mediaFirstAssignedMusicLibrary
-        case .appleMusic:
+        case .appleMusicCatalog, .appleMusicPreview:
             return .mediaFirstAssignedAppleMusicCatalog
-        case .localAudio:
+        case .importedLocal, .generatedLocal:
             return .mediaFirstAssignedImportedLocal
-        case .builtInClip:
+        case .builtin, .builtinIntentional, .recordedAnnouncement, .unknown:
             return nil
         }
     }
@@ -1211,7 +1218,18 @@ final class RollCallTelemetryCoordinator {
         guard ordinaryRecordingGate, isAvailableForProductPolicy else { return }
         var validatedProperties = properties
         validatedProperties[.telemetrySchemaVersion] = "1"
-        guard let signal = try? RollCallTelemetryValidator.shared.validate(event: event, properties: validatedProperties) else { return }
+        let signal: RollCallTelemetrySignal
+        do {
+            signal = try RollCallTelemetryValidator.shared.validate(event: event, properties: validatedProperties)
+        } catch {
+            // Failing closed is correct in the field — a malformed signal must never
+            // ship. But swallowing it silently is how `state.recoveryTriggered` went
+            // unemitted for a whole release: the call site passed a property the
+            // allowlist did not grant, and nothing surfaced it. Make the mismatch
+            // loud in development while keeping shipping builds fail-closed.
+            assertionFailureForTelemetryValidation(event: event, properties: validatedProperties, error: error)
+            return
+        }
         provider.send(signal)
     }
 
@@ -1447,6 +1465,14 @@ final class RollCallTelemetryCoordinator {
         return true
     }
 
+    /// Records one confirmed player cue against the live analytics session.
+    ///
+    /// - Returns: whether the cue was **accepted and recorded** — not whether it
+    ///   qualified a probable game. A single confirmed cue returns `true` even
+    ///   though four are required to qualify. Rejections (uncorrelated request id,
+    ///   no confirmed start, cancelled, debounced, wrong team, stale checkpoint)
+    ///   return `false`. Probable-game qualification is observable only through the
+    ///   emitted `game.probable` signal and `probableGameDates`, never from here.
     @discardableResult
     func handlePlayerPlayback(
         teamID: UUID,
@@ -1989,6 +2015,26 @@ final class RollCallTelemetryCoordinator {
             properties: [.newValue: value, .telemetrySchemaVersion: "1"]
         ) else { return }
         provider.send(signal)
+    }
+
+    /// Surfaces an allowlist/value mismatch during development only. Release and
+    /// Internal builds keep the fail-closed behaviour with no user-visible effect.
+    private func assertionFailureForTelemetryValidation(
+        event: RollCallTelemetryEvent,
+        properties: [RollCallTelemetryProperty: String],
+        error: Error
+    ) {
+        #if DEBUG
+        let described = properties
+            .map { "\($0.key.rawValue)=\($0.value)" }
+            .sorted()
+            .joined(separator: ", ")
+        assertionFailure(
+            "Telemetry allowlist rejected \(event.rawValue) [\(described)]: \(error). "
+                + "Add the property/value to allowedPropertiesByEvent or eventSpecificValues, "
+                + "or stop sending it at the call site."
+        )
+        #endif
     }
 
     private func sendNarrow(_ event: RollCallTelemetryEvent) {

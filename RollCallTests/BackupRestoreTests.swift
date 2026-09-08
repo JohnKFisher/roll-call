@@ -184,6 +184,85 @@ final class BackupRestoreTests: XCTestCase {
         XCTAssertTrue(assetExists("shared-announcer.caf"))
     }
 
+    /// Snapshot asset references are cached and keyed on the snapshot record list,
+    /// so a *newly created* backup must invalidate that cache. This does two photo
+    /// replacements: the first warms the cache while only the original backup exists,
+    /// then a second backup is taken that references the intermediate photo. If the
+    /// cache went stale, that intermediate photo would look unreferenced and be
+    /// deleted — losing a file a backup still depends on.
+    @MainActor
+    func testBackupCreatedAfterCacheIsWarmStillProtectsItsAssets() async throws {
+        var player = RollCallTestFixtures.player(
+            id: RollCallTestFixtures.alexID,
+            name: "Alex Ramirez",
+            number: "12",
+            photoRelativePath: "photo-a.jpg"
+        )
+        player.photoSourceRelativePath = "master-a.jpg"
+        try writeState(RollCallTestFixtures.appState(team: RollCallTestFixtures.team(players: [player])))
+        for name in ["photo-a.jpg", "master-a.jpg", "photo-b.jpg", "master-b.jpg", "photo-c.jpg", "master-c.jpg"] {
+            try writeAsset(name)
+        }
+        let model = AppModel()
+
+        // Backup 1 references photo-a. Replacing a -> b warms the reference cache.
+        try await model.createBackupAndWait(reason: "First backup")
+        var draft = try XCTUnwrap(model.selectedTeam?.players.first)
+        draft.photoRelativePath = "photo-b.jpg"
+        draft.photoSourceRelativePath = "master-b.jpg"
+        model.commitPlayerEditorDraft(draft)
+        await model.flushLatestState()
+        XCTAssertTrue(assetExists("photo-a.jpg"), "Backup 1 still references photo-a.")
+
+        // Backup 2 references photo-b. The cache must notice the new snapshot.
+        try await model.createBackupAndWait(reason: "Second backup")
+        draft = try XCTUnwrap(model.selectedTeam?.players.first)
+        draft.photoRelativePath = "photo-c.jpg"
+        draft.photoSourceRelativePath = "master-c.jpg"
+        model.commitPlayerEditorDraft(draft)
+        await model.flushLatestState()
+
+        XCTAssertTrue(assetExists("photo-b.jpg"), "Backup 2 references photo-b; a stale cache would have deleted it.")
+        XCTAssertTrue(assetExists("master-b.jpg"), "Backup 2 references master-b; a stale cache would have deleted it.")
+        XCTAssertTrue(assetExists("photo-a.jpg"))
+        XCTAssertTrue(assetExists("photo-c.jpg"))
+    }
+
+    /// An unreadable snapshot must keep the conservative behaviour: if we cannot
+    /// prove an asset is unreferenced, it stays. Caching must not turn a failed read
+    /// into a permissive answer.
+    @MainActor
+    func testUnreadableBackupSnapshotStillRetainsEveryAsset() async throws {
+        var player = RollCallTestFixtures.player(
+            id: RollCallTestFixtures.alexID,
+            name: "Alex Ramirez",
+            number: "12",
+            photoRelativePath: "old-profile.jpg"
+        )
+        player.photoSourceRelativePath = "old-master.jpg"
+        try writeState(RollCallTestFixtures.appState(team: RollCallTestFixtures.team(players: [player])))
+        for name in ["old-profile.jpg", "old-master.jpg", "new-profile.jpg", "new-master.jpg"] {
+            try writeAsset(name)
+        }
+        let model = AppModel()
+        try await model.createBackupAndWait(reason: "Corruptible backup")
+
+        // Corrupt the snapshot on disk after it was recorded.
+        let snapshot = try XCTUnwrap(model.state.snapshots.first)
+        let snapshotURL = try AppPaths.snapshotsDirectory()
+            .appendingPathComponent(snapshot.relativeManifestPath)
+        try Data("not json".utf8).write(to: snapshotURL, options: .atomic)
+
+        var draft = try XCTUnwrap(model.selectedTeam?.players.first)
+        draft.photoRelativePath = "new-profile.jpg"
+        draft.photoSourceRelativePath = "new-master.jpg"
+        model.commitPlayerEditorDraft(draft)
+        await model.flushLatestState()
+
+        XCTAssertTrue(assetExists("old-profile.jpg"), "An unreadable backup must fail closed and retain assets.")
+        XCTAssertTrue(assetExists("old-master.jpg"), "An unreadable backup must fail closed and retain assets.")
+    }
+
     @MainActor
     func testReplacingPlayerPhotoKeepsPriorMasterAndProfileReferencedByBackup() async throws {
         var player = RollCallTestFixtures.player(
@@ -255,7 +334,7 @@ final class BackupRestoreTests: XCTestCase {
     }
 
     @MainActor
-    func testReplacingGeneratedBuiltInAnnouncerRemovesOldUnreferencedFile() throws {
+    func testReplacingGeneratedBuiltInAnnouncerRemovesOldUnreferencedFile() async throws {
         let player = RollCallTestFixtures.player(
             id: RollCallTestFixtures.alexID,
             name: "Alex Ramirez",
@@ -278,6 +357,9 @@ final class BackupRestoreTests: XCTestCase {
             onTeamID: team.id
         )
 
+        // Staged cleanup only runs once a persist lands.
+        await model.flushLatestState()
+
         XCTAssertEqual(
             model.state.teams.first?.players.first?.generatedBuiltInAnnouncerRelativePath,
             "new-announcer.caf"
@@ -287,7 +369,7 @@ final class BackupRestoreTests: XCTestCase {
     }
 
     @MainActor
-    func testClearingGeneratedBuiltInAnnouncerRemovesOldFileWhenUnused() throws {
+    func testClearingGeneratedBuiltInAnnouncerRemovesOldFileWhenUnused() async throws {
         let player = RollCallTestFixtures.player(
             id: RollCallTestFixtures.alexID,
             name: "Alex Ramirez",
@@ -300,6 +382,9 @@ final class BackupRestoreTests: XCTestCase {
         let model = AppModel()
 
         model.applyGeneratedBuiltInAnnouncerAsset(nil, toPlayerID: player.id, onTeamID: team.id)
+
+        // Staged cleanup only runs once a persist lands.
+        await model.flushLatestState()
 
         XCTAssertNil(model.state.teams.first?.players.first?.generatedBuiltInAnnouncerRelativePath)
         XCTAssertFalse(assetExists("old-announcer.caf"))

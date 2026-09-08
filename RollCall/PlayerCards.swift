@@ -125,16 +125,36 @@ struct PlayerCardRenderer {
         context.drawLinearGradient(gradient, start: CGPoint(x: rect.midX, y: rect.minY), end: CGPoint(x: rect.midX, y: rect.maxY), options: [])
     }
 
+    /// The bundled brand mark used by the card attribution.
+    ///
+    /// Deliberately **not** `UIImage(named: "AppIcon")`. The app icon lives in an
+    /// asset catalog / Icon Composer bundle that exposes no decodable image to
+    /// `UIImage`, and its initializer raises `NSInternalInconsistencyException`
+    /// ("Need an imageRef") from `_UIImageCGImageContent` rather than returning
+    /// nil — an Objective-C exception Swift cannot catch, which terminated the
+    /// process while rendering any Player Card. Use the loose card-safe copy of
+    /// the app icon here instead of asking UIKit to decode the AppIcon catalog.
+    private static let bundledBrandIcon: UIImage? = drawableIcon(
+        UIImage(named: "AppIcon-iOS-Default-1024@1x")
+    )
+
+    private static func drawableIcon(_ image: UIImage?) -> UIImage? {
+        guard let image, image.size.width > 0, image.size.height > 0 else { return nil }
+        return image
+    }
+
     private func drawAttribution(in rect: CGRect, color: UIColor, icon: UIImage?) {
         let iconRect = CGRect(x: rect.minX, y: rect.midY - 23, width: 46, height: 46)
-        if let icon = icon ?? UIImage(named: "AppIcon") ?? UIImage(named: "RollCallDocumentIcon-320x320") {
+        let resolvedIcon = Self.drawableIcon(icon) ?? Self.bundledBrandIcon
+        let textInset: CGFloat = resolvedIcon == nil ? 0 : 62
+        if let resolvedIcon {
             UIGraphicsGetCurrentContext()?.saveGState()
             let path = UIBezierPath(roundedRect: iconRect, cornerRadius: 10)
             path.addClip()
-            icon.draw(in: iconRect)
+            resolvedIcon.draw(in: iconRect)
             UIGraphicsGetCurrentContext()?.restoreGState()
         }
-        drawText("Made with Roll Call", in: CGRect(x: rect.minX + 62, y: rect.minY, width: rect.width - 62, height: rect.height), font: .systemFont(ofSize: 25, weight: .semibold), color: color, alignment: .left)
+        drawText("Made with Roll Call", in: CGRect(x: rect.minX + textInset, y: rect.minY, width: rect.width - textInset, height: rect.height), font: .systemFont(ofSize: 25, weight: .semibold), color: color, alignment: .left)
     }
 
     private func drawText(_ text: String, in rect: CGRect, font: UIFont, color: UIColor, alignment: NSTextAlignment, tracking: CGFloat = 0) {
@@ -221,6 +241,7 @@ struct PlayerCardPreviewSheet: View {
     @State private var renderedImage: UIImage?
     @State private var shareImage: UIImage?
     @State private var framingImage: UIImage?
+    @State private var framingOptions: PlayerPhotoFramingOptionSet?
     @State private var framingUsesWorkingMaster = false
     @State private var framingPresented = false
     @State private var renderError: String?
@@ -244,7 +265,7 @@ struct PlayerCardPreviewSheet: View {
                             .frame(minHeight: 420)
                     }
 
-                    if framingImage != nil {
+                    if framingImage != nil, framingOptions != nil {
                         Button {
                             framingPresented = true
                         } label: {
@@ -286,11 +307,12 @@ struct PlayerCardPreviewSheet: View {
                 }
             }
             .fullScreenCover(isPresented: $framingPresented) {
-                if let framingImage {
+                if let framingImage, let framingOptions {
                     PhotoFramingEditorSheet(
                         image: framingImage,
                         initialCrop: effectiveCardCrop(for: framingImage),
                         aspectRatio: PlayerPhotoFramingGeometry.playerCardPhotoAspectRatio,
+                        framingOptions: framingOptions.card,
                         title: "Adjust Player Card Photo",
                         onCancel: { framingPresented = false },
                         onApply: { crop in
@@ -345,6 +367,11 @@ struct PlayerCardPreviewSheet: View {
 
         guard !Task.isCancelled else { return }
         framingImage = output.framingImage
+        if let framingImage = output.framingImage {
+            framingOptions = await PlayerPhotoPreparationService().framingOptions(for: framingImage)
+        } else {
+            framingOptions = nil
+        }
         framingUsesWorkingMaster = output.usesWorkingMaster
         guard output.card.cgImage != nil else {
             renderedImage = nil

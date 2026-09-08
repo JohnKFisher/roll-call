@@ -82,6 +82,52 @@ final class PlayerCardTests: XCTestCase {
         XCTAssertEqual(content.artistName, "AC/DC")
     }
 
+    /// Regression guard for the crash where the attribution mark was loaded with
+    /// `UIImage(named: "AppIcon")`. That initializer raises an uncatchable
+    /// Objective-C exception for an asset-catalog/Icon Composer app icon, so every
+    /// Player Card render terminated the process. The renderer must resolve its
+    /// brand mark without ever constructing an image from the app icon.
+    func testDefaultBrandIconRendersWithoutRaising() throws {
+        let player = playerWithSong()
+        let team = team(containing: player, accent: .gold)
+
+        let card = PlayerCardRenderer().render(
+            content: PlayerCardContent(player: player, team: team),
+            photo: samplePhoto(),
+            crop: PlayerPhotoFramingGeometry.centeredCrop(
+                aspectRatio: PlayerPhotoFramingGeometry.playerCardPhotoAspectRatio,
+                imageSize: samplePhoto().size
+            ),
+            brandIcon: nil
+        )
+
+        XCTAssertEqual(card.size, PlayerCardRenderer.outputSize)
+        XCTAssertNotNil(card.pngData())
+    }
+
+    /// The renderer must still produce a complete card when no brand mark can be
+    /// loaded at all, rather than drawing the attribution text under a gap.
+    func testExplicitlySuppliedBrandIconIsUsedAndZeroSizedIconIsIgnored() throws {
+        let player = playerWithSong()
+        let team = team(containing: player, accent: .blue)
+        let content = PlayerCardContent(player: player, team: team)
+
+        let marked = PlayerCardRenderer().render(
+            content: content,
+            photo: nil,
+            crop: nil,
+            brandIcon: UIGraphicsImageRenderer(size: CGSize(width: 64, height: 64)).image { context in
+                UIColor.systemPink.setFill()
+                context.fill(CGRect(x: 0, y: 0, width: 64, height: 64))
+            }
+        )
+        let unmarked = PlayerCardRenderer().render(content: content, photo: nil, crop: nil, brandIcon: UIImage())
+
+        XCTAssertEqual(marked.size, PlayerCardRenderer.outputSize)
+        XCTAssertEqual(unmarked.size, PlayerCardRenderer.outputSize)
+        XCTAssertNotEqual(try XCTUnwrap(marked.pngData()), try XCTUnwrap(unmarked.pngData()))
+    }
+
     private func playerWithSong() -> Player {
         var player = RollCallTestFixtures.player(id: UUID(), name: "Alex Ramirez", number: "12")
         player.songAssignment = .privateClip(

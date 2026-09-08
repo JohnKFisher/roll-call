@@ -2,6 +2,25 @@ import XCTest
 @testable import RollCall
 
 final class QuickGameDayTests: XCTestCase {
+    @MainActor
+    func testControlDestinationIntentQueuesSystemControlRequest() async throws {
+        let center = OpenGameDayRequestCenter.shared
+        if let pendingRequest = center.pendingRequest {
+            center.consume(id: pendingRequest.id)
+        }
+
+        defer {
+            if let pendingRequest = center.pendingRequest {
+                center.consume(id: pendingRequest.id)
+            }
+        }
+
+        _ = try await OpenGameDayFromControlIntent().perform()
+
+        XCTAssertNil(center.pendingRequest?.explicitTeamID)
+        XCTAssertEqual(center.pendingRequest?.source, .systemControl)
+    }
+
     func testTelemetrySourceUsesOnlyReliablyKnownSystemPath() {
         XCTAssertEqual(QuickGameDayInvocationSource.appIntent.telemetryValue, "appIntent")
         XCTAssertEqual(QuickGameDayInvocationSource.systemControl.telemetryValue, "systemControl")
