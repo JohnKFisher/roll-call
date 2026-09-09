@@ -23,6 +23,7 @@ enum AppError: LocalizedError {
     case noAudioTrack
     case microphonePermissionDenied
     case recordingUnavailable
+    case recordingCancelled
     case customIntroSaveFailed(String)
     case invalidAnnouncerText
     case invalidAnnouncerAudio
@@ -61,6 +62,8 @@ enum AppError: LocalizedError {
             return "Microphone access is required to record an Announcement Cue."
         case .recordingUnavailable:
             return "Custom announcer recording is not available right now."
+        case .recordingCancelled:
+            return "Custom announcer recording was cancelled."
         case .customIntroSaveFailed(let detail):
             return "Roll Call could not save that Announcement Cue recording. [\(AppMetadata.appVersion) build \(AppMetadata.buildNumber) \(AppMetadata.customIntroStorageMarker)] \(detail)"
         case .invalidAnnouncerText:

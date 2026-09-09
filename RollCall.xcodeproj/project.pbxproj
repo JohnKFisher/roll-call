@@ -59,6 +59,7 @@
 		A60000000000000000000001 /* MusicRenderProbeTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A60000000000000000000101 /* MusicRenderProbeTests.swift */; };
 		A60000000000000000000002 /* SongClipGenerationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A60000000000000000000102 /* SongClipGenerationTests.swift */; };
 		A60000000000000000000003 /* GeneratedClipCleanupTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A60000000000000000000103 /* GeneratedClipCleanupTests.swift */; };
+		B40000000000000000000001 /* CustomAnnouncerRecorderTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = B40000000000000000000101 /* CustomAnnouncerRecorderTests.swift */; };
 		A70000000000000000000001 /* SongClipModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = A70000000000000000000101 /* SongClipModels.swift */; };
 		A70000000000000000000002 /* SongClipGenerationService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A70000000000000000000102 /* SongClipGenerationService.swift */; };
 		A70000000000000000000003 /* SongClipGenerationQueue.swift in Sources */ = {isa = PBXBuildFile; fileRef = A70000000000000000000103 /* SongClipGenerationQueue.swift */; };
@@ -152,6 +153,7 @@
 		A60000000000000000000101 /* MusicRenderProbeTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MusicRenderProbeTests.swift; sourceTree = "<group>"; };
 		A60000000000000000000102 /* SongClipGenerationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SongClipGenerationTests.swift; sourceTree = "<group>"; };
 		A60000000000000000000103 /* GeneratedClipCleanupTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = GeneratedClipCleanupTests.swift; sourceTree = "<group>"; };
+		B40000000000000000000101 /* CustomAnnouncerRecorderTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CustomAnnouncerRecorderTests.swift; sourceTree = "<group>"; };
 		A70000000000000000000101 /* SongClipModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SongClipModels.swift; sourceTree = "<group>"; };
 		A70000000000000000000102 /* SongClipGenerationService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SongClipGenerationService.swift; sourceTree = "<group>"; };
 		A70000000000000000000103 /* SongClipGenerationQueue.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SongClipGenerationQueue.swift; sourceTree = "<group>"; };
@@ -279,6 +281,7 @@
 				A60000000000000000000101 /* MusicRenderProbeTests.swift */,
 				A60000000000000000000102 /* SongClipGenerationTests.swift */,
 				A60000000000000000000103 /* GeneratedClipCleanupTests.swift */,
+				B40000000000000000000101 /* CustomAnnouncerRecorderTests.swift */,
 			);
 			path = RollCallTests;
 			sourceTree = "<group>";
@@ -494,6 +497,7 @@
 				A60000000000000000000001 /* MusicRenderProbeTests.swift in Sources */,
 				A60000000000000000000002 /* SongClipGenerationTests.swift in Sources */,
 				A60000000000000000000003 /* GeneratedClipCleanupTests.swift in Sources */,
+				B40000000000000000000001 /* CustomAnnouncerRecorderTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};

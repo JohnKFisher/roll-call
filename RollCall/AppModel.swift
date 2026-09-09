@@ -352,37 +352,112 @@ private final class AnnouncerRenderCompletionState: @unchecked Sendable {
     }
 }
 
-private final class CustomAnnouncerStopState: @unchecked Sendable {
-    private let lock = NSLock()
-    private var pendingStopURL: URL?
-    private var stopContinuation: CheckedContinuation<URL, Error>?
+final class CustomAnnouncerStopState: @unchecked Sendable {
+    struct Cancellation {
+        let recorder: AnyObject?
+        let url: URL?
+        let continuation: CheckedContinuation<URL, Error>?
 
-    func beginStop(url: URL, continuation: CheckedContinuation<URL, Error>) {
-        lock.lock()
-        pendingStopURL = url
-        stopContinuation = continuation
-        lock.unlock()
+        var claimed: Bool {
+            recorder != nil || url != nil || continuation != nil
+        }
     }
 
-    func takePendingStop() -> (URL?, CheckedContinuation<URL, Error>?) {
+    private let lock = NSLock()
+    private var activeSessionID: UUID?
+    private var activeURL: URL?
+    private var activeRecorder: AnyObject?
+    private var pendingStopSessionID: UUID?
+    private var pendingStopURL: URL?
+    private var pendingStopRecorder: AnyObject?
+    private var stopContinuation: CheckedContinuation<URL, Error>?
+
+    @discardableResult
+    func beginRecording(
+        sessionID: UUID,
+        url: URL,
+        recorder: AnyObject,
+        onBegin: () -> Void
+    ) -> Bool {
         lock.lock()
         defer { lock.unlock() }
+        guard activeSessionID == nil,
+              pendingStopSessionID == nil,
+              stopContinuation == nil else { return false }
+        onBegin()
+        activeSessionID = sessionID
+        activeURL = url
+        activeRecorder = recorder
+        return true
+    }
+
+    @discardableResult
+    func beginStop(
+        sessionID: UUID,
+        recorder: AnyObject,
+        continuation: CheckedContinuation<URL, Error>
+    ) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard activeSessionID == sessionID,
+              let activeURL,
+              activeRecorder === recorder,
+              pendingStopSessionID == nil,
+              stopContinuation == nil else { return false }
+        pendingStopSessionID = sessionID
+        self.activeURL = nil
+        pendingStopURL = activeURL
+        pendingStopRecorder = recorder
+        stopContinuation = continuation
+        return true
+    }
+
+    func takePendingStop(
+        sessionID: UUID,
+        recorder: AnyObject,
+        onComplete: () -> Void
+    ) -> (URL?, CheckedContinuation<URL, Error>?) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard pendingStopSessionID == sessionID, pendingStopRecorder === recorder else { return (nil, nil) }
         let result = (pendingStopURL, stopContinuation)
+        activeSessionID = nil
+        activeURL = nil
+        activeRecorder = nil
+        pendingStopSessionID = nil
         pendingStopURL = nil
+        pendingStopRecorder = nil
         stopContinuation = nil
+        onComplete()
         return result
     }
 
-    func hasPendingStop() -> Bool {
+    func cancel(onClaim: () -> Void) -> Cancellation {
         lock.lock()
         defer { lock.unlock() }
-        return pendingStopURL != nil || stopContinuation != nil
+        let cancellation = Cancellation(
+            recorder: pendingStopRecorder ?? activeRecorder,
+            url: pendingStopURL ?? activeURL,
+            continuation: stopContinuation
+        )
+        activeSessionID = nil
+        activeURL = nil
+        activeRecorder = nil
+        pendingStopSessionID = nil
+        pendingStopURL = nil
+        pendingStopRecorder = nil
+        stopContinuation = nil
+        if cancellation.claimed {
+            onClaim()
+        }
+        return cancellation
     }
 }
 
 final class CustomAnnouncerRecorder: NSObject, AVAudioRecorderDelegate, @unchecked Sendable {
     private var recorder: AVAudioRecorder?
     private var recordingURL: URL?
+    private var recordingSessionID: UUID?
     private(set) var recordingPlayerID: UUID?
     private let stopState = CustomAnnouncerStopState()
 
@@ -426,27 +501,53 @@ final class CustomAnnouncerRecorder: NSObject, AVAudioRecorderDelegate, @uncheck
             try FileManager.default.removeItem(at: destinationURL)
         }
         let recorder = try AVAudioRecorder(url: destinationURL, settings: settings)
+        let sessionID = UUID()
         recorder.delegate = self
         recorder.prepareToRecord()
         guard recorder.record() else { throw AppError.recordingUnavailable }
 
-        self.recorder = recorder
-        self.recordingURL = destinationURL
-        self.recordingPlayerID = playerID
+        guard stopState.beginRecording(
+            sessionID: sessionID,
+            url: destinationURL,
+            recorder: recorder,
+            onBegin: {
+                self.recorder = recorder
+                self.recordingURL = destinationURL
+                self.recordingSessionID = sessionID
+                self.recordingPlayerID = playerID
+            }
+        ) else {
+            recorder.stop()
+            try? FileManager.default.removeItem(at: destinationURL)
+            throw AppError.recordingUnavailable
+        }
     }
 
     func stopRecording() async throws -> URL {
-        guard let recorder, let recordingURL else { throw AppError.recordingUnavailable }
+        guard let recorder, recordingURL != nil, let sessionID = recordingSessionID else {
+            throw AppError.recordingUnavailable
+        }
         return try await withCheckedThrowingContinuation { continuation in
-            stopState.beginStop(url: recordingURL, continuation: continuation)
+            guard stopState.beginStop(
+                sessionID: sessionID,
+                recorder: recorder,
+                continuation: continuation
+            ) else {
+                continuation.resume(throwing: AppError.recordingUnavailable)
+                return
+            }
             recorder.stop()
         }
     }
 
     nonisolated func audioRecorderDidFinishRecording(_ recorder: AVAudioRecorder, successfully flag: Bool) {
-        let (finishedURL, continuation) = stopState.takePendingStop()
+        guard self.recorder === recorder, let sessionID = recordingSessionID else { return }
+        let (finishedURL, continuation) = stopState.takePendingStop(
+            sessionID: sessionID,
+            recorder: recorder,
+            onComplete: { self.clearRecordingState() }
+        )
         guard let continuation else { return }
-        clearRecordingState()
 
         guard let finishedURL else {
             continuation.resume(throwing: AppError.customIntroSaveFailed("recorder finished with no destination url"))
@@ -455,6 +556,7 @@ final class CustomAnnouncerRecorder: NSObject, AVAudioRecorderDelegate, @uncheck
 
         let fileSize = (try? finishedURL.resourceValues(forKeys: [.fileSizeKey]).fileSize) ?? 0
         guard fileSize > 0 else {
+            try? FileManager.default.removeItem(at: finishedURL)
             continuation.resume(throwing: AppError.customIntroSaveFailed("finish flag=\(flag), \(customIntroFileSummary(for: finishedURL))"))
             return
         }
@@ -463,32 +565,33 @@ final class CustomAnnouncerRecorder: NSObject, AVAudioRecorderDelegate, @uncheck
     }
 
     nonisolated func audioRecorderEncodeErrorDidOccur(_ recorder: AVAudioRecorder, error: Error?) {
-        let (_, continuation) = stopState.takePendingStop()
+        guard self.recorder === recorder, let sessionID = recordingSessionID else { return }
+        let (failedURL, continuation) = stopState.takePendingStop(
+            sessionID: sessionID,
+            recorder: recorder,
+            onComplete: { self.clearRecordingState() }
+        )
         guard let continuation else { return }
-        clearRecordingState()
+        if let failedURL {
+            try? FileManager.default.removeItem(at: failedURL)
+        }
         continuation.resume(throwing: AppError.customIntroSaveFailed("encode callback: \(customIntroErrorSummary(error))"))
-    }
-
-    private func finishPendingStopAsCancelled() {
-        let (_, continuation) = stopState.takePendingStop()
-        guard let continuation else { return }
-        continuation.resume(throwing: AppError.recordingUnavailable)
     }
 
     private func clearRecordingState() {
         self.recorder = nil
         self.recordingURL = nil
+        self.recordingSessionID = nil
         self.recordingPlayerID = nil
     }
 
     func cancelRecording() {
-        guard !stopState.hasPendingStop() else { return }
-        let recordingURL = self.recordingURL
-        recorder?.stop()
-        clearRecordingState()
-        finishPendingStopAsCancelled()
-        if let recordingURL {
-            try? FileManager.default.removeItem(at: recordingURL)
+        let cancellation = stopState.cancel(onClaim: { self.clearRecordingState() })
+        guard cancellation.claimed else { return }
+        (cancellation.recorder as? AVAudioRecorder)?.stop()
+        cancellation.continuation?.resume(throwing: AppError.recordingCancelled)
+        if let url = cancellation.url {
+            try? FileManager.default.removeItem(at: url)
         }
         recordingPlayerID = nil
     }
@@ -566,6 +669,7 @@ final class AppModel: ObservableObject {
     @Published private(set) var appleMusicPlaybackCapability: AppleMusicPlaybackCapability = .unknown
     @Published private(set) var customAnnouncerRecordingPhase: CustomAnnouncerRecordingPhase = .idle
     @Published var pendingRecoveryNavigation: RecoveryNavigationDestination?
+    private var customAnnouncerSessionID: UUID?
     @Published private(set) var gameDayLineupProgressHintEvent: GameDayLineupProgressHintEvent?
     @Published private(set) var pendingSongClipPreparationCount = 0
     @Published private(set) var generatedClipCleanupReport: GeneratedClipCleanupReport?
@@ -1638,12 +1742,21 @@ final class AppModel: ObservableObject {
     }
 
     func startRecordingCustomAnnouncer(forPlayerID playerID: UUID) async {
+        let sessionID = UUID()
+        customAnnouncerSessionID = sessionID
         customAnnouncerRecordingPhase = .starting(playerID)
         do {
             let destinationURL = customAnnouncerTemporaryURL(fileExtension: "caf")
             try await customAnnouncerRecorder.startRecording(for: playerID, destinationURL: destinationURL)
+            guard customAnnouncerSessionID == sessionID else {
+                customAnnouncerRecorder.cancelRecording()
+                try? configurePlaybackAudioSession()
+                return
+            }
             customAnnouncerRecordingPhase = .recording(playerID)
         } catch {
+            guard customAnnouncerSessionID == sessionID else { return }
+            customAnnouncerSessionID = nil
             customAnnouncerRecordingPhase = .idle
             if let appError = error as? AppError, case .microphonePermissionDenied = appError {
                 telemetry.recordOnce(.microphoneAccessDenied, properties: [.result: "denied"])
@@ -1653,16 +1766,30 @@ final class AppModel: ObservableObject {
     }
 
     func stopRecordingCustomAnnouncer(forPlayerID playerID: UUID) async {
+        guard let sessionID = customAnnouncerSessionID else {
+            customAnnouncerRecorder.cancelRecording()
+            customAnnouncerRecordingPhase = .idle
+            return
+        }
         guard let teamIndex,
               let playerIndex = state.teams[teamIndex].players.firstIndex(where: { $0.id == playerID }) else {
             customAnnouncerRecorder.cancelRecording()
+            customAnnouncerSessionID = nil
             customAnnouncerRecordingPhase = .idle
             return
         }
         let player = state.teams[teamIndex].players[playerIndex]
         customAnnouncerRecordingPhase = .stopping(playerID)
+        var recordedURLForCleanup: URL?
         do {
             let recordedURL = try await customAnnouncerRecorder.stopRecording()
+            recordedURLForCleanup = recordedURL
+            guard customAnnouncerSessionID == sessionID,
+                  customAnnouncerRecordingPhase == .stopping(playerID) else {
+                try? FileManager.default.removeItem(at: recordedURL)
+                recordedURLForCleanup = nil
+                return
+            }
             let asset: LocalAudioSource
             do {
                 let replacementRelativePath = player.customAnnouncerRelativePath == nil
@@ -1685,14 +1812,25 @@ final class AppModel: ObservableObject {
             updated.customAnnouncerRelativePath = asset.relativePath
             updatePlayer(updated)
             try configurePlaybackAudioSession()
+            recordedURLForCleanup = nil
+            customAnnouncerSessionID = nil
             customAnnouncerRecordingPhase = .idle
         } catch {
+            guard customAnnouncerSessionID == sessionID else { return }
+            if let recordedURLForCleanup {
+                try? FileManager.default.removeItem(at: recordedURLForCleanup)
+            }
+            customAnnouncerSessionID = nil
             customAnnouncerRecordingPhase = .idle
+            if let appError = error as? AppError, case .recordingCancelled = appError {
+                return
+            }
             lastError = error.localizedDescription
         }
     }
 
     func cancelRecordingCustomAnnouncer() {
+        customAnnouncerSessionID = nil
         customAnnouncerRecorder.cancelRecording()
         customAnnouncerRecordingPhase = .idle
         try? configurePlaybackAudioSession()

@@ -7123,10 +7123,25 @@ private struct StateRecoveryLaunchView: View {
 
 private struct RecoveryCenterView: View {
     @ObservedObject var appModel: AppModel
-    @State private var backupPendingRestore: SnapshotRecord?
-    @State private var recentlyDeletedPendingPermanentDelete: RecentlyDeletedItem?
-    @State private var pendingPartialRestorePrompt: PartialRestorePrompt?
+    @State private var pendingRecoveryAlert: RecoveryAlert?
     @State private var pendingRecoveryArchiveDeletion: URL?
+
+    private enum RecoveryAlert: Identifiable {
+        case backupRestore(SnapshotRecord)
+        case permanentDelete(RecentlyDeletedItem)
+        case partialRestore(PartialRestorePrompt)
+
+        var id: String {
+            switch self {
+            case .backupRestore(let snapshot):
+                return "backup-\(snapshot.id.uuidString)"
+            case .permanentDelete(let item):
+                return "permanent-delete-\(item.id.uuidString)"
+            case .partialRestore(let prompt):
+                return "partial-restore-\(prompt.id.uuidString)"
+            }
+        }
+    }
 
     var body: some View {
         List {
@@ -7201,7 +7216,7 @@ private struct RecoveryCenterView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                             Button("Restore Backup") {
-                                backupPendingRestore = snapshot
+                                pendingRecoveryAlert = .backupRestore(snapshot)
                             }
                             .rollCallButtonStyle(.secondary)
                         }
@@ -7215,36 +7230,34 @@ private struct RecoveryCenterView: View {
         .onAppear {
             appModel.refreshRecoveryState()
         }
-        .alert(item: $backupPendingRestore) { snapshot in
-            Alert(
-                title: Text("Restore Backup?"),
-                message: Text("This will replace your current teams, players, and clips with the selected backup while keeping your current settings. Roll Call will save a safety backup first."),
-                primaryButton: .cancel(),
-                secondaryButton: .destructive(Text("Restore Backup")) {
+        .alert(recoveryAlertTitle, isPresented: recoveryAlertIsPresented, presenting: pendingRecoveryAlert) { alert in
+            switch alert {
+            case .backupRestore(let snapshot):
+                Button("Restore Backup", role: .destructive) {
                     Task { await appModel.restoreBackup(snapshot) }
                 }
-            )
-        }
-        .alert(item: $recentlyDeletedPendingPermanentDelete) { item in
-            Alert(
-                title: Text("Delete Permanently?"),
-                message: Text(permanentDeleteMessage(for: item)),
-                primaryButton: .cancel(),
-                secondaryButton: .destructive(Text("Delete Permanently")) {
+                Button("Cancel", role: .cancel) {}
+            case .permanentDelete(let item):
+                Button("Delete Permanently", role: .destructive) {
                     appModel.permanentlyDeleteRecentlyDeletedItem(item)
                 }
-            )
-        }
-        .alert(item: $pendingPartialRestorePrompt) { prompt in
-            Alert(
-                title: Text(prompt.title),
-                message: Text(prompt.message),
-                primaryButton: .cancel(),
-                secondaryButton: .default(Text("Restore What We Can")) {
+                Button("Cancel", role: .cancel) {}
+            case .partialRestore(let prompt):
+                Button("Restore What We Can") {
                     guard let item = appModel.state.recentlyDeleted.first(where: { $0.id == prompt.itemID }) else { return }
                     appModel.restoreRecentlyDeletedItem(item, allowPartial: true)
                 }
-            )
+                Button("Cancel", role: .cancel) {}
+            }
+        } message: { alert in
+            switch alert {
+            case .backupRestore:
+                Text("This will replace your current teams, players, and clips with the selected backup while keeping your current settings. Roll Call will save a safety backup first.")
+            case .permanentDelete(let item):
+                Text(permanentDeleteMessage(for: item))
+            case .partialRestore(let prompt):
+                Text(prompt.message)
+            }
         }
         .confirmationDialog(
             "Remove Preserved State File?",
@@ -7329,7 +7342,7 @@ private struct RecoveryCenterView: View {
         .padding(.vertical, 2)
         .swipeActions(edge: .trailing, allowsFullSwipe: false) {
             Button("Delete Permanently", role: .destructive) {
-                recentlyDeletedPendingPermanentDelete = item
+                pendingRecoveryAlert = .permanentDelete(item)
             }
         }
     }
@@ -7341,7 +7354,26 @@ private struct RecoveryCenterView: View {
         case .blocked(let message):
             appModel.lastError = message
         case .partialPrompt(let prompt):
-            pendingPartialRestorePrompt = prompt
+            pendingRecoveryAlert = .partialRestore(prompt)
+        }
+    }
+
+    private var recoveryAlertIsPresented: Binding<Bool> {
+        Binding(
+            get: { pendingRecoveryAlert != nil },
+            set: { if !$0 { pendingRecoveryAlert = nil } }
+        )
+    }
+
+    private var recoveryAlertTitle: String {
+        guard let pendingRecoveryAlert else { return "Recovery" }
+        switch pendingRecoveryAlert {
+        case .backupRestore:
+            return "Restore Backup?"
+        case .permanentDelete:
+            return "Delete Permanently?"
+        case .partialRestore(let prompt):
+            return prompt.title
         }
     }
 
@@ -8104,7 +8136,7 @@ private struct PlayerQuickAddView: View {
                 .disabled(!canAddPlayer)
             }
         }
-    }
+    }                                                                                                                                                                                                                                                                             
 
     private func addPlayerAndReset() {
         appModel.addPlayer(name: name, number: number)
@@ -8596,7 +8628,8 @@ private struct PlayerEditorSheet: View {
             }
             .onDisappear {
                 photoFramingRequestID = nil
-                if appModel.isRecordingCustomAnnouncer(for: player) {
+                if appModel.isRecordingCustomAnnouncer(for: player)
+                    || appModel.isCustomAnnouncerTransitioning(for: player) {
                     appModel.cancelRecordingCustomAnnouncer()
                 }
                 if !didCommitDraft {

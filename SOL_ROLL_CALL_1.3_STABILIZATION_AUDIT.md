@@ -12,7 +12,7 @@ The greatest immediate value is to:
 
 1. complete the remaining physical system-control matrix and add audio-session interruption handling with a live-device interruption matrix;
 2. harden ownership/recovery edges, beginning with bounded team-package archive extraction and then the Recovery presentation gate;
-3. fix the remaining bounded state-machine and reporting defects, including recorder cancellation and missing-media grammar.
+3. complete runtime validation of the bounded recorder-cancellation state machine and address the remaining missing-media grammar issue.
 
 ## Repository / Product Model
 
@@ -29,6 +29,8 @@ Quick Game Day stores the team most recently entered intentionally, resolves an 
 **Area:** Player Cards
 
 **Confidence:** Confirmed
+
+**Status (2026-09-09):** Implemented in the working tree after owner approval. The recorder now uses one lock-protected recording/stopping lifecycle with per-session identity, cancellation claims the pending stop exactly once, and Player Editor dismissal cancels both recording and saving phases. Engineering verification is pending; owner/device acceptance remains open.
 
 **Status (2026-09-09):** Closed for stabilization; owner verified the repaired Player Card appearance and flow. A drawable-resource regression test was added. Future visual cleanup, including the missing-photo placeholder, remains outside this stabilization fix.
 
@@ -630,18 +632,18 @@ Inspect archive entries before extraction and enforce conservative entry-count, 
 
 **Current status**
 
-Implementation is complete in build 146. File-form `.rollcall` imports and previews now inspect ZIP central-directory metadata before extraction, cap archive size, entry count, per-entry and total uncompressed bytes, and compression ratio, and reject traversal, absolute, duplicate, and symlink entries. Valid directory-style packages and the existing schema-9 package format are unchanged. Owner/device acceptance remains open for representative package compatibility and malformed-archive behavior.
+Implementation is complete in build 146, and the owner has verified that import/export behaves normally on a physical device. File-form `.rollcall` imports and previews now inspect ZIP central-directory metadata before extraction, cap archive size, entry count, per-entry and total uncompressed bytes, and compression ratio, and reject traversal, absolute, duplicate, and symlink entries. Valid directory-style packages and the existing schema-9 package format remain unchanged. This P2 is closed for the stabilization pass; the broader package/device matrix remains release evidence.
 
 **Verification performed**
 
 - Build-for-testing succeeded on the iOS 27 simulator with Swift 6 at build 146; marketing version remains 1.3.0.
 - The focused `PackageServiceTests` suite executed 20 tests with 0 failures. It includes valid schema-9/photo/audio/Apple Music round trips plus generated traversal, absolute-path, duplicate-entry, symlink, high-ratio, excessive-entry, and oversized-entry fixtures.
 
-**Exact verification still needed**
+**Owner verification**
 
-- On a physical device, preview/import representative existing 1.2 and 1.3 packages containing valid photos, Announcement Cues, local audio, generated clips, and Apple Music references; confirm unchanged audit/readiness behavior and no temporary-directory residue.
-- Exercise malformed archives and confirm rejection is quick, user-facing as “That file could not be imported,” the app remains responsive, and no permanent team/assets are changed.
-- Confirm cleanup after successful preview/import, rejection, and an injected copy failure.
+- Owner verified that physical-device import/export behaves normally after the hardening change.
+- Automated fixtures verify quick `invalidImport` rejection for traversal, absolute, duplicate-path, symlink, high-ratio, excessive-entry, and oversized-entry archives without extraction.
+- The full 1.2/1.3 media matrix, malformed-archive UX, and injected copy-failure cleanup remain broader release evidence rather than blockers for this closed finding.
 
 **Additional release evidence**
 
@@ -649,7 +651,8 @@ Implementation is complete in build 146. File-form `.rollcall` imports and previ
 
 **Change log**
 
-- 2026-09-09: Owner approved archive-boundary hardening. Added ZIPFoundation central-directory preflight before file-form package extraction, conservative archive/entry/resource limits, and rejection for traversal, absolute, duplicate, and symlink entries. Build-for-testing passed at build 146; focused `PackageServiceTests` passed 20/20 on the iOS 27 simulator. Physical valid-package compatibility and malformed-archive checks remain open.
+- 2026-09-09: Owner approved archive-boundary hardening. Added ZIPFoundation central-directory preflight before file-form package extraction, conservative archive/entry/resource limits, and rejection for traversal, absolute, duplicate, and symlink entries. Build-for-testing passed at build 146; focused `PackageServiceTests` passed 20/20 on the iOS 27 simulator.
+- 2026-09-09: Owner verified that physical-device import/export behaves normally. The Team-package archive finding is closed for this stabilization pass; broader package/device coverage remains release evidence.
 
 ---
 
@@ -657,7 +660,7 @@ Implementation is complete in build 146. File-form `.rollcall` imports and previ
 
 **Area:** UI
 
-**Confidence:** Needs validation
+**Confidence:** Implemented; needs runtime validation
 
 **Problem**
 
@@ -665,13 +668,14 @@ Implementation is complete in build 146. File-form `.rollcall` imports and previ
 
 **Evidence**
 
-- `RootView.swift`, `RecoveryCenterView.body`, consecutively applies `.alert(item:)` for `backupPendingRestore`, `recentlyDeletedPendingPermanentDelete`, and `pendingPartialRestorePrompt`.
+- Before the fix, `RootView.swift`, `RecoveryCenterView.body`, consecutively applied `.alert(item:)` for `backupPendingRestore`, `recentlyDeletedPendingPermanentDelete`, and `pendingPartialRestorePrompt`.
+- The current body uses one `pendingRecoveryAlert` enum and one modern `alert(_:isPresented:presenting:actions:message:)` presenter.
 - The rest of the app commonly uses the modern `alert(_:isPresented:presenting:actions:message:)` form.
 - There are state/service tests for backup and Recently Deleted operations, but no UI presentation test proving that all three confirmations appear and execute their intended action.
 
 **Root cause**
 
-Independent modal states were layered onto one view using an obsolete presenter API rather than one explicit recovery alert route.
+Independent modal states were layered onto one view using an obsolete presenter API rather than one explicit recovery alert route. The approved fix replaces those states with one identifiable `RecoveryAlert` route and one modern `alert(_:isPresented:presenting:actions:message:)` presenter.
 
 **Why it matters**
 
@@ -679,7 +683,7 @@ A missing confirmation can make restore or permanent delete appear dead, or can 
 
 **Recommended change**
 
-Replace the three modifiers with one identifiable recovery-alert route and one modern alert presenter. Keep each action's role, message, and async behavior explicit.
+Completed in the working tree: replaced the three modifiers with one identifiable recovery-alert route and one modern alert presenter. Each action's role, message, and async behavior remains explicit.
 
 **Scope / guardrails**
 
@@ -695,13 +699,31 @@ Replace the three modifiers with one identifiable recovery-alert route and one m
 
 - Add UI tests for backup restore, full item restore, partial restore, and permanent delete confirmation/cancel paths using disposable fixtures.
 
+**Implementation / verification update (2026-09-09)**
+
+- `RecoveryCenterView` now uses one `RecoveryAlert` state and one modern alert presenter. Backup restore, partial restore, and permanent deletion retain their previous actions and messages; full restores remain direct actions.
+- Focused source inspection confirms that the old stacked `.alert(item:)` modifiers and their independent state are gone.
+- Build-for-testing passed for the iOS simulator, and the focused `BackupRestoreTests`, `RecentlyDeletedTests`, and `AppStatePersistenceTests` command exited 0 on the iOS 27 simulator. These suites verify the underlying recovery/backup state operations, not SwiftUI alert presentation.
+
+**Exact verification still needed**
+
+- On a device or simulator, exercise backup restore, full item restore, partial restore, and permanent deletion; confirm each alert title/message, cancel path, and confirm action.
+- Trigger candidate actions in quick succession and confirm no stale or cross-wired alert content.
+- Confirm backup restore still creates its safety backup and permanent deletion remains explicitly confirmed.
+
+**Change log**
+
+- 2026-09-09: Owner approved the single-route Recovery alert fix. Replaced three stacked legacy alert presenters with one identifiable modern alert route; runtime presentation verification remains open.
+
 ---
 
 ## [P2] Announcement recording cancel is a no-op during the save phase
 
 **Area:** State
 
-**Confidence:** Confirmed
+**Confidence:** Confirmed; implementation pending runtime validation
+
+**Status (2026-09-09):** Implemented in the working tree after owner approval. The recorder now uses one lock-protected recording/stopping lifecycle with per-session identity, cancellation claims the pending stop exactly once, and Player Editor dismissal cancels starting, recording, and saving phases. Engineering verification passed; owner/device acceptance remains open.
 
 **Problem**
 
@@ -709,10 +731,9 @@ Replace the three modifiers with one identifiable recovery-alert route and one m
 
 **Evidence**
 
-- `AppModel.swift`, `CustomAnnouncerRecorder.cancelRecording`: `guard !stopState.hasPendingStop() else { return }`, followed later by `finishPendingStopAsCancelled()`.
-- `finishPendingStopAsCancelled` can only do work when `hasPendingStop` was true, which the guard excludes.
-- `PlayerEditorSheet.onDisappear` calls `appModel.cancelRecordingCustomAnnouncer`; the model sets `.idle` regardless of whether the recorder cancelled.
-- No recorder state-transition test covers cancel while `stopRecording()` awaits the encoder callback.
+- Before the fix, `AppModel.swift`, `CustomAnnouncerRecorder.cancelRecording` returned while `stopRecording()` had a pending delegate continuation; its later cancellation-resume path was unreachable for that case.
+- `PlayerEditorSheet.onDisappear` called `appModel.cancelRecordingCustomAnnouncer`, but the model could set `.idle` while recorder work remained pending.
+- No recorder state-transition test covered cancel while `stopRecording()` awaited the encoder callback.
 
 **Root cause**
 
@@ -724,7 +745,7 @@ Closing the editor during save can leave pending work/state behind, produce a la
 
 **Recommended change**
 
-Define explicit idle/recording/stopping states. Either disable dismissal/cancel while stopping with visible progress, or make cancel atomically take and fail the pending continuation, stop/clear the recorder, and remove only the uncommitted temp file. The model must derive its UI phase from the same result.
+Make cancellation atomically take either the active recording or pending stop continuation, synchronize in-memory recorder-field clearing with that claim, then stop/delete/resume outside the lock. Match delegate callbacks to the active recorder/session so stale callbacks cannot affect a later recording. Keep the model's UI phase guarded by the same session token and treat expected cancellation as non-error.
 
 **Scope / guardrails**
 
@@ -738,7 +759,22 @@ Define explicit idle/recording/stopping states. Either disable dismissal/cancel 
 
 **Tests / verification**
 
-- Add a fake-recorder/delegate state-machine test for every cancel/stop callback ordering, double cancel, encoding error, and parent dismissal.
+- Added `CustomAnnouncerRecorderTests` for active-recording cancellation, callback-first completion, cancel-first completion, duplicate terminal handling, stale session callbacks, and immediate subsequent recording. Build/test verification and runtime owner checks remain to be recorded below.
+
+**Verification performed**
+
+- Build-for-testing succeeded at build 146 on the iOS 27 simulator after the final race fixes.
+- The focused `CustomAnnouncerRecorderTests` run completed successfully with 4/4 passed. The selected `AppStatePersistenceTests` all reported passed before Xcode stalled finalizing simulator diagnostics; that separate command was stopped after its test cases completed, so its overall harness exit was inconclusive.
+- `git diff --check` passed.
+
+**Exact verification still needed**
+
+- On a physical device, start an Announcement Cue, tap Stop Recording, then dismiss the editor while the button says `Saving Recording...`; confirm the pending save cancels cleanly, no error appears, no partial temporary file remains, and an existing saved cue is unchanged.
+- Repeat cancel during active recording, then record again immediately; confirm microphone permission denial behavior, playback audio-session restoration, and successful save behavior are unchanged.
+
+**Change log**
+
+- 2026-09-09: Owner approved the cancellation fix. Replaced the pending-stop no-op with an atomic recording/stopping arbiter, added session and recorder identity protection with atomic in-memory cleanup, cleaned failed temporary files, suppressed expected cancellation errors, and made Player Editor dismissal cover starting, recording, and saving phases. Focused simulator tests and build verification passed; runtime/device verification remains open.
 
 ---
 
@@ -857,7 +893,7 @@ Use one generic locale-aware list formatter/helper for all counts and singular/p
 
 ## Persistence / Restoration
 
-**Mostly healthy in ordinary operation, needs stabilization in disaster recovery and hostile import.** Normal state writes are serialized, background flush waits for durability, asset cleanup is conservative around backups/Recently Deleted, imports do not overwrite existing teams, and package compatibility has strong tests. Primary-state decode failure is not recoverable through the product, archive extraction is unbounded, and recovery confirmations lack presentation proof.
+**Mostly healthy in ordinary operation, needs stabilization in disaster recovery and Recovery presentation.** Normal state writes are serialized, background flush waits for durability, asset cleanup is conservative around backups/Recently Deleted, imports do not overwrite existing teams, and package compatibility now includes bounded archive preflight plus physical import/export acceptance. Primary-state decode failure is not recoverable through the product, and recovery confirmations lack presentation proof.
 
 ## Onboarding / Settings / General UI
 
@@ -902,8 +938,8 @@ The smallest material improvement is not “more unit tests.” Add one app UI/i
 2. **Stabilize the live moment.** Device-accept the Volume Automation baseline candidate, add audio interruption/media-reset handling, and run the full local/catalog/preview/announcement/fallback device matrix.
 3. **Repair typed readiness semantics.** Emit independent player-audio and Announcement Cue checks, then make all UI classification category-based.
 4. **Isolate telemetry persistence.** Introduce serial off-main storage with slow/failure tests while preserving policy semantics exactly.
-6. **Harden ownership/recovery edges.** Bound archive extraction and consolidate Recovery alerts.
-7. **Fix bounded state-machine and reporting defects.** Repair recorder cancellation and missing-media grammar.
+5. **Harden ownership/recovery edges.** The archive boundary is now bounded and owner-verified; consolidate the Recovery alerts.
+7. **Finish bounded state-machine and reporting validation.** Owner-verify recorder cancellation on device, then address the remaining missing-media grammar issue.
 8. **Remove confirmed dead code last.** Once behavior is stable and green, delete unreachable probes/trim/voice remnants without mixing cleanup into functional repairs.
 
 # Post-Fix Verification Plan

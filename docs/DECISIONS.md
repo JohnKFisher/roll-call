@@ -4,9 +4,17 @@ Use this file as a concise decision log for project-specific architectural, beha
 
 ## 2026-09-09
 
+- Approved for implementation: make Custom Announcer recording cancellation authoritative across recording and save phases. Use one lock-protected lifecycle with a per-recording session identity; let exactly one of delegate completion or cancellation claim the terminal transition; synchronize in-memory field clearing under that lock while keeping stop/delete/resume work outside it; preserve committed recordings; ignore expected cancellation as an error; and cancel active sessions when Player Editor is dismissed, including while saving.
+  Rationale: the previous cancellation guard returned while a stop continuation was pending, allowing the UI to reset while recorder work remained active and making dismissal unsafe.
+  Status: implemented in the working tree with four focused state-arbiter tests reported passed and build-for-testing passing at build 146; Xcode stalled during simulator diagnostic finalization, and owner/device verification remains open
+
+- Approved for implementation: consolidate Recovery's backup-restore, partial-restore, and permanent-delete confirmations behind one identifiable alert route and one modern SwiftUI alert presenter. Preserve each action's existing destructive/default role, message, cancel behavior, and async backup-restore operation.
+  Rationale: stacked legacy alert presenters on the Recovery list can compete or present stale content at the app's destructive/recovery boundary; one explicit route keeps the selected recovery action and confirmation state aligned.
+  Status: implemented in the working tree; build-for-testing and focused recovery/state tests passed on the iOS 27 simulator, while runtime presentation and owner/device acceptance remain open.
+
 - Approved for implementation: preflight file-form `.rollcall` ZIP archives before extraction. Enforce conservative archive-size, entry-count, per-entry, total-uncompressed, and compression-ratio limits; reject traversal, absolute, duplicate, and symlink entries; preserve directory-package compatibility and schema-9 package contents; and keep rejection confined to the unique temporary import root.
   Rationale: `.rollcall` transfer is a core ownership and backup path, so an untrusted archive must not be able to consume unbounded resources or create unsafe filesystem entries before Roll Call can validate its manifest.
-  Status: implemented and focused-verified in build 146; 20/20 `PackageServiceTests` passed on the iOS 27 simulator. Physical representative-package compatibility and malformed-archive acceptance remain open.
+  Status: implemented and focused-verified in build 146; 20/20 `PackageServiceTests` passed on the iOS 27 simulator. Owner verified that physical-device import/export behaves normally; broader package/device coverage remains release evidence.
 
 - Approved for implementation: keep live telemetry candidate construction on the main actor, but enqueue immutable snapshots to one serial background persistence writer. Release dependent signals only after the corresponding ordered write succeeds; bound the live queue, stop after the first failed revision, restore the last durable snapshot, and require explicit retry. An opt-out generation invalidates queued ordinary signals. The telemetry schema and rating reservation durability contract remain unchanged.
   Rationale: live playback must not wait for JSON encoding or atomic file replacement, while persist-before-send, conservative false negatives, and privacy opt-out ordering remain safety invariants.
