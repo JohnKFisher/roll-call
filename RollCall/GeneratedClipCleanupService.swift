@@ -29,28 +29,15 @@ struct GeneratedClipCleanupService {
             let inventory = try generatedClipInventory(in: generatedDirectory)
             var referencedPaths = generatedClipReferences(in: state)
 
-            for snapshot in state.snapshots {
-                let snapshotURL = try snapshotURL(for: snapshot)
-                guard fileManager.fileExists(atPath: snapshotURL.path) else {
-                    return blockedReport(
-                        inventory: inventory,
-                        reason: "A backup snapshot is missing, so Roll Call retained every generated clip."
-                    )
-                }
-                do {
-                    let decoder = JSONDecoder()
-                    decoder.dateDecodingStrategy = .iso8601
-                    let snapshotState = try decoder.decode(
-                        AppState.self,
-                        from: Data(contentsOf: snapshotURL)
-                    )
+            do {
+                for snapshotState in try snapshotStatesIncludingOrphanedFiles(in: state) {
                     referencedPaths.formUnion(generatedClipReferences(in: snapshotState))
-                } catch {
-                    return blockedReport(
-                        inventory: inventory,
-                        reason: "A backup snapshot could not be read, so Roll Call retained every generated clip."
-                    )
                 }
+            } catch {
+                return blockedReport(
+                    inventory: inventory,
+                    reason: "A backup snapshot could not be read, so Roll Call retained every generated clip."
+                )
             }
 
             if activePreparationCount > 0 {
@@ -124,14 +111,48 @@ struct GeneratedClipCleanupService {
 
     private func allReferencesIncludingSnapshots(in state: AppState) throws -> Set<String> {
         var references = generatedClipReferences(in: state)
-        for snapshot in state.snapshots {
-            let url = try snapshotURL(for: snapshot)
-            let decoder = JSONDecoder()
-            decoder.dateDecodingStrategy = .iso8601
-            let snapshotState = try decoder.decode(AppState.self, from: Data(contentsOf: url))
+        for snapshotState in try snapshotStatesIncludingOrphanedFiles(in: state) {
             references.formUnion(generatedClipReferences(in: snapshotState))
         }
         return references
+    }
+
+    private func snapshotStatesIncludingOrphanedFiles(in state: AppState) throws -> [AppState] {
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        var urls: [URL] = []
+
+        for snapshot in state.snapshots {
+            let url = try snapshotURL(for: snapshot)
+            guard fileManager.fileExists(atPath: url.path) else {
+                throw AppError.invalidImport
+            }
+            urls.append(url)
+        }
+
+        let snapshotsDirectory = try AppPaths.snapshotsDirectory()
+        let knownPaths = Set(urls.map { $0.standardizedFileURL.path })
+        let orphanedSnapshotFiles = try fileManager.contentsOfDirectory(
+            at: snapshotsDirectory,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ).filter { url in
+            guard url.pathExtension.lowercased() == "json",
+                  let values = try? url.resourceValues(forKeys: [.isRegularFileKey]),
+                  values.isRegularFile == true else {
+                return false
+            }
+            return !knownPaths.contains(url.standardizedFileURL.path)
+        }
+        urls.append(contentsOf: orphanedSnapshotFiles)
+
+        return try urls.map { url in
+            let snapshotState = try decoder.decode(AppState.self, from: Data(contentsOf: url))
+            guard snapshotState.schemaVersion <= AppState.currentSchemaVersion else {
+                throw AppError.unsupportedSavedStateVersion
+            }
+            return snapshotState
+        }
     }
 
     private func snapshotURL(for snapshot: SnapshotRecord) throws -> URL {

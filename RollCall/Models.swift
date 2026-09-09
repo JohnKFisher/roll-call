@@ -851,6 +851,41 @@ struct ReadinessStatus: Codable, Equatable {
     var teamID: UUID? = nil
 }
 
+enum ReadinessCheckFiltering {
+    static func playerAudioChecks(from checks: [ReadinessCheck]) -> [ReadinessCheck] {
+        checks.filter { $0.category == .playerAudio }
+    }
+}
+
+struct GameDayReadinessWarningContext {
+    let presentPlayerIDs: Set<UUID>
+    let announcerMode: GameDayAnnouncerMode
+    let volumeAutomationEnabled: Bool
+}
+
+/// The checks that can interrupt the live Game Day experience. Volume
+/// automation fades and restores playback, but it does not raise the device's
+/// output baseline, so a low-volume warning must remain visible when it is on.
+enum GameDayReadinessWarningPolicy {
+    static func shouldSurface(
+        _ check: ReadinessCheck,
+        context: GameDayReadinessWarningContext
+    ) -> Bool {
+        guard check.state == .issue else { return false }
+        if check.category == .playerPhoto { return false }
+        if check.category == .playerAnnouncement {
+            return context.announcerMode.usesAnnouncer
+        }
+        if check.category == .playerAudio {
+            return check.playerID.map(context.presentPlayerIDs.contains) ?? false
+        }
+        if check.category == .volume {
+            return true
+        }
+        return [.audioRoute, .network, .appleMusicAccess, .lineup].contains(check.category)
+    }
+}
+
 struct SnapshotRecord: Codable, Equatable, Identifiable {
     var id: UUID
     var createdAt: Date
@@ -1343,6 +1378,23 @@ enum AppPaths {
     static func unreadableStateRecoveryURL() throws -> URL {
         let fileName = "state-unreadable-\(UUID().uuidString).json"
         return try baseDirectory().appendingPathComponent(fileName)
+    }
+
+    static func unreadableStateRecoveryFiles() -> [URL] {
+        guard let directory = try? baseDirectory(),
+              let files = try? FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: [.contentModificationDateKey],
+                options: [.skipsHiddenFiles]
+              ) else {
+            return []
+        }
+        return files
+            .filter {
+                $0.lastPathComponent.hasPrefix("state-unreadable-")
+                    && $0.pathExtension.lowercased() == "json"
+            }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 
     static func telemetryStateURL() throws -> URL {

@@ -1078,6 +1078,31 @@ final class SongClipGenerationTests: XCTestCase {
         XCTAssertEqual(schedule.stopDelay, 2.25)
     }
 
+    func testPlaybackVolumeBaselineFadesInPlayerDomainAndRestoresIt() {
+        let baseline = PlaybackVolumeBaseline(
+            systemOutputVolume: 0.40,
+            playbackVolume: 0.90
+        )
+
+        XCTAssertEqual(baseline.systemOutputVolume, 0.40, accuracy: 0.001)
+        XCTAssertEqual(baseline.playbackVolume(at: 1), 0.90, accuracy: 0.001)
+        XCTAssertEqual(baseline.playbackVolume(at: 0.5), 0.45, accuracy: 0.001)
+        XCTAssertEqual(baseline.playbackVolume(at: 0), 0, accuracy: 0.001)
+        XCTAssertEqual(baseline.playbackVolume, 0.90, accuracy: 0.001)
+    }
+
+    func testPlaybackVolumeBaselineClampsInvalidInputs() {
+        let baseline = PlaybackVolumeBaseline(
+            systemOutputVolume: .nan,
+            playbackVolume: 2
+        )
+
+        XCTAssertEqual(baseline.systemOutputVolume, 1, accuracy: 0.001)
+        XCTAssertEqual(baseline.playbackVolume, 1, accuracy: 0.001)
+        XCTAssertEqual(baseline.playbackVolume(at: -1), 0, accuracy: 0.001)
+        XCTAssertEqual(baseline.playbackVolume(at: .infinity), 0, accuracy: 0.001)
+    }
+
     func testMissingLocalSourceFailsPermanentlyWithoutCreatingAsset() async {
         let service = SongClipGenerationService()
         let clip = SongClip(cue: RollCallTestFixtures.localCue(relativePath: "missing.caf"))

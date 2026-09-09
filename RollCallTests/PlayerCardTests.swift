@@ -105,6 +105,21 @@ final class PlayerCardTests: XCTestCase {
         XCTAssertNotNil(card.pngData())
     }
 
+    /// The renderer intentionally uses a loose PNG rather than the special
+    /// AppIcon catalog. Keep the resource in the app bundle so the safe source
+    /// used by the crash repair cannot silently disappear from a Release build.
+    func testAppBundleContainsDrawableBrandIconResource() throws {
+        let appBundle = Bundle(identifier: "com.jkfisher.rollcall") ?? .main
+        let resourceURL = try XCTUnwrap(
+            appBundle.url(forResource: "AppIcon-iOS-Default-1024@1x", withExtension: "png")
+        )
+        let image = try XCTUnwrap(UIImage(contentsOfFile: resourceURL.path))
+
+        XCTAssertGreaterThan(image.size.width, 0)
+        XCTAssertGreaterThan(image.size.height, 0)
+        XCTAssertNotNil(image.cgImage)
+    }
+
     /// The renderer must still produce a complete card when no brand mark can be
     /// loaded at all, rather than drawing the attribution text under a gap.
     func testExplicitlySuppliedBrandIconIsUsedAndZeroSizedIconIsIgnored() throws {

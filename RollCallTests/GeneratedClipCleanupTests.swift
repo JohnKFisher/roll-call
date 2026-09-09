@@ -99,6 +99,20 @@ final class GeneratedClipCleanupTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: retained.path))
     }
 
+    func testCleanupRetainsGeneratedFilesReferencedByOrphanSnapshot() throws {
+        let retained = try writeGeneratedFile("orphan-backup.m4a", bytes: 9)
+        let snapshotState = stateReferencingGeneratedClip("GeneratedClips/\(retained.lastPathComponent)")
+        try writeSnapshot(snapshotState, named: "orphan-backup.json")
+
+        let report = service.clean(
+            state: RollCallTestFixtures.appState(),
+            activePreparationCount: 0
+        )
+
+        XCTAssertEqual(report.removedFileCount, 0)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: retained.path))
+    }
+
     func testCleanupAbortsWhenBackupCannotBeRead() throws {
         let retained = try writeGeneratedFile("uncertain.m4a", bytes: 13)
         var state = RollCallTestFixtures.appState()

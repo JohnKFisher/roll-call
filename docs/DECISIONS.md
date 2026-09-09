@@ -2,6 +2,30 @@
 
 Use this file as a concise decision log for project-specific architectural, behavioral, tooling, and scope decisions.
 
+## 2026-09-09
+
+- Approved for implementation: preflight file-form `.rollcall` ZIP archives before extraction. Enforce conservative archive-size, entry-count, per-entry, total-uncompressed, and compression-ratio limits; reject traversal, absolute, duplicate, and symlink entries; preserve directory-package compatibility and schema-9 package contents; and keep rejection confined to the unique temporary import root.
+  Rationale: `.rollcall` transfer is a core ownership and backup path, so an untrusted archive must not be able to consume unbounded resources or create unsafe filesystem entries before Roll Call can validate its manifest.
+  Status: implemented and focused-verified in build 146; 20/20 `PackageServiceTests` passed on the iOS 27 simulator. Physical representative-package compatibility and malformed-archive acceptance remain open.
+
+- Approved for implementation: keep live telemetry candidate construction on the main actor, but enqueue immutable snapshots to one serial background persistence writer. Release dependent signals only after the corresponding ordered write succeeds; bound the live queue, stop after the first failed revision, restore the last durable snapshot, and require explicit retry. An opt-out generation invalidates queued ordinary signals. The telemetry schema and rating reservation durability contract remain unchanged.
+  Rationale: live playback must not wait for JSON encoding or atomic file replacement, while persist-before-send, conservative false negatives, and privacy opt-out ordering remain safety invariants.
+  Status: implemented and focused-verified in build 144; 36/36 `TelemetryTests` reported passed on the iOS 27 simulator, including automated opt-out invalidation coverage. Owner accepted the physical live-use result; broader slow-writer and route-matrix checks remain release evidence.
+
+- Qualified and owner-verified for the current Volume Automation implementation: capture both the pre-cue `AVAudioSession.outputVolume` and the MediaPlayer playback-volume value, but use only the MediaPlayer value as the fade and restore anchor. Never programmatically raise or change the device output volume; retain the audio-session value for diagnostics and readiness context. A replacement cue restores the outgoing playback baseline before the next cue captures its own baseline.
+  Rationale: the physical regression showed that the audio-session and MediaPlayer volume domains cannot be assumed interchangeable. The candidate preserves the no-change-before-fade contract while preventing a replacement cue from inheriting a mid-fade gain.
+  Status: accepted for the reproduced regression; broader device/route matrix remains release evidence
+
+## 2026-09-08
+
+- Reverted: the first audio-session interruption integration was rolled back after a critical regression where Game Day songs stopped playing while announcements continued to work. A redesigned interruption coordinator remains pending device-tested implementation; the established playback path is restored while this is investigated.
+  Rationale: Game Day song playback is a protected live-use invariant and takes priority over an unvalidated interruption repair.
+  Status: rollback applied for 1.3; interruption handling pending
+
+- Approved: unreadable or future-schema primary state enters a fail-closed recovery launch flow. Roll Call leaves the original bytes untouched until an explicit retry, compatible snapshot restore, or Start Fresh choice; it discovers valid snapshot files independently of state metadata, preserves raw recovery copies for sharing, blocks normal lifecycle and telemetry mutation during recovery, and verifies replacement state by re-reading it before resuming normal launch. Generated-clip cleanup also considers orphaned snapshots and blocks on unreadable or future snapshot files.
+  Rationale: a malformed or newer state file must not silently become an empty team list, and recovery must preserve both user data and generated media references while keeping unsupported formats available for a newer build.
+  Status: approved for 1.3
+
 ## 2026-09-07
 
 - Approved: Player photos use one metadata-stripped, orientation-normalized working master bounded to 3000 pixels, plus an independent compact profile derivative and normalized Player Card crop. One on-device Vision pass seeds both framings; manual adjustments remain optional and follow Player Editor Save/Cancel. Existing cropped-only photos remain valid as the available source until replaced.

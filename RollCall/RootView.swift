@@ -854,7 +854,11 @@ struct RootView: View {
     }
 
     var body: some View {
-        rootLifecycleContent
+        if appModel.requiresStateRecoveryDecision {
+            StateRecoveryLaunchView(appModel: appModel)
+        } else {
+            rootLifecycleContent
+        }
     }
 
     private var rootBaseContent: some View {
@@ -2019,19 +2023,13 @@ struct RootView: View {
         }
 
         guard let readiness = appModel.selectedTeamReadiness else { return false }
+        let warningContext = GameDayReadinessWarningContext(
+            presentPlayerIDs: Set(presentPlayers.map(\.id)),
+            announcerMode: team.session.gameDayAnnouncerMode,
+            volumeAutomationEnabled: appModel.state.settings.fadeOutVolumeAutomationEnabled
+        )
         return readiness.checks.contains { check in
-            guard check.state == .issue else { return false }
-            if check.category == .playerPhoto { return false }
-            if check.category == .playerAnnouncement {
-                return team.session.gameDayAnnouncerMode.usesAnnouncer
-            }
-            if check.category == .playerAudio {
-                return check.playerID.map { playerID in presentPlayers.contains { $0.id == playerID } } ?? false
-            }
-            if check.category == .volume {
-                return !appModel.state.settings.fadeOutVolumeAutomationEnabled
-            }
-            return [.audioRoute, .network, .appleMusicAccess, .lineup].contains(check.category)
+            GameDayReadinessWarningPolicy.shouldSurface(check, context: warningContext)
         }
     }
 
@@ -2385,7 +2383,7 @@ struct RootView: View {
     }
 
     private func playerAudioReadinessChecks(from checks: [ReadinessCheck]) -> [ReadinessCheck] {
-        checks.filter { $0.category == .playerAudio }
+        ReadinessCheckFiltering.playerAudioChecks(from: checks)
     }
 
     private func openImportedRepair(
@@ -3366,11 +3364,7 @@ private struct ReadinessOverviewCard: View {
     }
 
     private var playerChecks: [ReadinessCheck] {
-        readiness.checks.filter { check in
-            check.id.hasPrefix("player-")
-                && !check.id.contains("announcement-upgrade")
-                && !check.id.contains("photo-upgrade")
-        }
+        ReadinessCheckFiltering.playerAudioChecks(from: readiness.checks)
     }
 
     private var readyCount: Int {
@@ -5956,18 +5950,12 @@ private struct GameDayTeamStack: View {
     }
 
     private func isLiveReadinessIssue(_ check: ReadinessCheck) -> Bool {
-        guard check.state == .issue else { return false }
-        if check.category == .playerPhoto { return false }
-        if check.category == .playerAnnouncement {
-            return team.session.gameDayAnnouncerMode.usesAnnouncer
-        }
-        if check.category == .playerAudio {
-            return check.playerID.map { playerID in presentPlayers.contains { $0.id == playerID } } ?? false
-        }
-        if check.category == .volume {
-            return !appModel.state.settings.fadeOutVolumeAutomationEnabled
-        }
-        return [.audioRoute, .network, .appleMusicAccess, .lineup].contains(check.category)
+        let warningContext = GameDayReadinessWarningContext(
+            presentPlayerIDs: Set(presentPlayers.map(\.id)),
+            announcerMode: team.session.gameDayAnnouncerMode,
+            volumeAutomationEnabled: appModel.state.settings.fadeOutVolumeAutomationEnabled
+        )
+        return GameDayReadinessWarningPolicy.shouldSurface(check, context: warningContext)
     }
 
     private func role(for state: ReadinessState) -> StatusChipRole {
@@ -7041,14 +7029,134 @@ private struct LineupEditorSheet: View {
     }
 }
 
+private struct StateRecoveryLaunchView: View {
+    @ObservedObject var appModel: AppModel
+    @State private var pendingSnapshotRestore: StateRecoverySnapshot?
+    @State private var showingStartFreshConfirmation = false
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section {
+                    Label(
+                        appModel.stateRecovery?.reason == .unsupportedSchema
+                            ? "This saved data was created by a newer version of Roll Call."
+                            : "Roll Call could not read its saved data.",
+                        systemImage: "exclamationmark.triangle.fill"
+                    )
+                    .foregroundStyle(Color.rollCall(.warning))
+
+                    Text(appModel.stateRecovery?.preservedStateURL == nil
+                         ? "Roll Call could not preserve the original file yet. Try Again before choosing a recovery option."
+                         : "Your original file has been preserved. Choose a recovery option before creating new teams or replacing the saved file.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+
+                if let recovery = appModel.stateRecovery {
+                    Section("Preserved State") {
+                        if let preservedStateURL = recovery.preservedStateURL {
+                            ShareLink(item: preservedStateURL) {
+                                Label("Share Preserved State File", systemImage: "square.and.arrow.up")
+                            }
+                        } else {
+                            Text("Roll Call could not create the recovery copy yet. Try Again before choosing another option.")
+                                .foregroundStyle(Color.rollCall(.warning))
+                        }
+
+                        Button("Try Again") {
+                            Task { await appModel.retryStateRecovery() }
+                        }
+
+                        Button("Start Fresh", role: .destructive) {
+                            showingStartFreshConfirmation = true
+                        }
+                        .disabled(recovery.preservedStateURL == nil)
+                    }
+
+                    Section("Recoverable Backups") {
+                        if recovery.snapshots.isEmpty {
+                            Text("No independently readable backups were found.")
+                                .foregroundStyle(.secondary)
+                        } else {
+                            ForEach(recovery.snapshots) { snapshot in
+                                VStack(alignment: .leading, spacing: 8) {
+                                    Text("Backup with \(snapshot.teamCount) team\(snapshot.teamCount == 1 ? "" : "s")")
+                                        .font(.headline)
+                                    Text(snapshot.url.lastPathComponent)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                    Button("Restore This Backup") {
+                                        pendingSnapshotRestore = snapshot
+                                    }
+                                    .rollCallButtonStyle(.secondary)
+                                }
+                                .padding(.vertical, 4)
+                            }
+                        }
+                    }
+                }
+            }
+            .accentWashListBackground()
+            .navigationTitle("Recover Your Data")
+            .alert(item: $pendingSnapshotRestore) { snapshot in
+                Alert(
+                    title: Text("Restore This Backup?"),
+                    message: Text("This will restore the teams and setup saved in this backup. Your preserved original state file will remain available afterward."),
+                    primaryButton: .cancel(),
+                    secondaryButton: .default(Text("Restore Backup")) {
+                        Task { await appModel.restoreStateRecoverySnapshot(snapshot) }
+                    }
+                )
+            }
+            .alert("Start Fresh?", isPresented: $showingStartFreshConfirmation) {
+                Button("Cancel", role: .cancel) {}
+                Button("Start Fresh", role: .destructive) {
+                    Task { await appModel.startFreshAfterStateRecovery() }
+                }
+            } message: {
+                Text("Roll Call will create a new empty state. The preserved original file will remain available in Recovery until you remove it.")
+            }
+        }
+    }
+}
+
 private struct RecoveryCenterView: View {
     @ObservedObject var appModel: AppModel
     @State private var backupPendingRestore: SnapshotRecord?
     @State private var recentlyDeletedPendingPermanentDelete: RecentlyDeletedItem?
     @State private var pendingPartialRestorePrompt: PartialRestorePrompt?
+    @State private var pendingRecoveryArchiveDeletion: URL?
 
     var body: some View {
         List {
+            if !appModel.stateRecoveryArchives.isEmpty {
+                Section("Preserved State Files") {
+                    Text("These are original state files preserved after Roll Call could not read saved data. Share one with support or remove it only when you are sure it is no longer needed.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+
+                    ForEach(appModel.stateRecoveryArchives, id: \.self) { url in
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text(url.lastPathComponent)
+                                .font(.subheadline.weight(.semibold))
+                            HStack {
+                                ShareLink(item: url) {
+                                    Label("Share", systemImage: "square.and.arrow.up")
+                                }
+                                .rollCallButtonStyle(.secondary)
+
+                                Button("Remove", role: .destructive) {
+                                    pendingRecoveryArchiveDeletion = url
+                                }
+                                .rollCallButtonStyle(.secondary)
+                            }
+                        }
+                        .padding(.vertical, 4)
+                    }
+                }
+            }
+
             Section("Recently Deleted") {
                 Text("Deleted teams, players, and Custom Clips stay here for 60 days unless you restore or permanently delete them.")
                     .font(.footnote)
@@ -7137,6 +7245,26 @@ private struct RecoveryCenterView: View {
                     appModel.restoreRecentlyDeletedItem(item, allowPartial: true)
                 }
             )
+        }
+        .confirmationDialog(
+            "Remove Preserved State File?",
+            isPresented: Binding(
+                get: { pendingRecoveryArchiveDeletion != nil },
+                set: { if !$0 { pendingRecoveryArchiveDeletion = nil } }
+            ),
+            titleVisibility: .visible
+        ) {
+            Button("Remove Preserved File", role: .destructive) {
+                if let url = pendingRecoveryArchiveDeletion {
+                    appModel.deleteStateRecoveryArchive(at: url)
+                }
+                pendingRecoveryArchiveDeletion = nil
+            }
+            Button("Cancel", role: .cancel) {
+                pendingRecoveryArchiveDeletion = nil
+            }
+        } message: {
+            Text("This cannot be undone in Roll Call.")
         }
     }
 

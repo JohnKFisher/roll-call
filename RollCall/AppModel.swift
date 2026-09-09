@@ -126,6 +126,28 @@ struct AnnouncerRegenerationStatus: Equatable {
     }
 }
 
+enum StateRecoveryReason: String, Equatable {
+    case unsupportedSchema
+    case loadFailure
+}
+
+struct StateRecoverySnapshot: Identifiable {
+    let id: URL
+    let url: URL
+    let state: AppState
+    let createdAt: Date
+
+    var teamCount: Int { state.teams.count }
+}
+
+struct StateRecoveryContext: Identifiable {
+    let id: URL
+    let reason: StateRecoveryReason
+    let primaryStateURL: URL
+    let preservedStateURL: URL?
+    let snapshots: [StateRecoverySnapshot]
+}
+
 enum CustomAnnouncerRecordingPhase: Equatable {
     case idle
     case starting(UUID)
@@ -519,6 +541,8 @@ final class AppModel: ObservableObject {
     let telemetry: RollCallTelemetryCoordinator
 
     @Published var state: AppState
+    @Published private(set) var stateRecovery: StateRecoveryContext?
+    @Published private(set) var stateRecoveryArchives: [URL]
     @Published private(set) var isBusy = false
     @Published var lastError: String?
     @Published var bannerMessage: AppBannerMessage?
@@ -592,6 +616,13 @@ final class AppModel: ObservableObject {
         let destinationURL: URL
     }
 
+    private struct InitialStateLoadResult {
+        let state: AppState
+        let warning: String?
+        let recoveryReason: String?
+        let recovery: StateRecoveryContext?
+    }
+
     var featureFlags: FeatureFlags {
         FeatureFlags(environment: .current, experimental: state.experimental)
     }
@@ -634,6 +665,8 @@ final class AppModel: ObservableObject {
         self.readinessService = ReadinessService(audioAssetService: audioAssetService)
         let loadResult = Self.loadInitialState()
         self.state = loadResult.state
+        self.stateRecovery = loadResult.recovery
+        self.stateRecoveryArchives = []
         if let telemetry {
             self.telemetry = telemetry
         } else {
@@ -669,7 +702,22 @@ final class AppModel: ObservableObject {
         self.state.appVersion = AppMetadata.appVersion
         self.state.schemaVersion = max(self.state.schemaVersion, AppState.empty.schemaVersion)
         normalizeRatingRequestPolicyState()
-        self.readinessService.onPathStatusChange = { [weak self] in
+        if stateRecovery == nil {
+            activateNormalStateLifecycle()
+            if let recoveryReason = loadResult.recoveryReason {
+                self.telemetry.record(.stateRecoveryTriggered, properties: [.reason: recoveryReason])
+            }
+        }
+        if let initialStateLoadWarning {
+            lastError = initialStateLoadWarning
+        }
+        if stateRecovery == nil {
+            persist()
+        }
+    }
+
+    private func activateNormalStateLifecycle() {
+        readinessService.onPathStatusChange = { [weak self] in
             self?.scheduleReadinessRefresh()
         }
         observeReadinessInputs()
@@ -677,20 +725,13 @@ final class AppModel: ObservableObject {
         FeatureFlags.assertReleaseSafety(featureFlags)
         normalizeSelectedTeamIfNeeded()
         normalizeAllTeams()
-        self.telemetry.validateLiveCheckpoint(
-            availableTeamIDs: Set(self.state.teams.map(\.id)),
-            selectedTeamID: self.state.selectedTeamID
+        telemetry.validateLiveCheckpoint(
+            availableTeamIDs: Set(state.teams.map(\.id)),
+            selectedTeamID: state.selectedTeamID
         )
         purgeExpiredRecentlyDeletedItems()
         reconcileOnboardingForExistingTeamIfNeeded()
-        self.telemetry.enroll(currentState: self.state)
-        if let recoveryReason = loadResult.recoveryReason {
-            self.telemetry.record(.stateRecoveryTriggered, properties: [.reason: recoveryReason])
-        }
-        if let initialStateLoadWarning {
-            lastError = initialStateLoadWarning
-        }
-        persist()
+        telemetry.enroll(currentState: state)
     }
 
     private static func makeDefaultTelemetryCoordinator(legacyAutomaticAttemptCount: Int) -> RollCallTelemetryCoordinator {
@@ -717,6 +758,7 @@ final class AppModel: ObservableObject {
     }
 
     func finishLaunchingIfNeeded() async {
+        guard stateRecovery == nil else { return }
         guard !hasFinishedLaunching else { return }
         hasFinishedLaunching = true
         telemetry.observeRetentionActivation(at: .now, wasAlreadyActive: false)
@@ -766,6 +808,120 @@ final class AppModel: ObservableObject {
 
     var selectedTeam: Team? {
         state.teams.first(where: { $0.id == state.selectedTeamID })
+    }
+
+    var requiresStateRecoveryDecision: Bool {
+        stateRecovery != nil
+    }
+
+    func retryStateRecovery() async {
+        guard stateRecovery != nil else { return }
+        do {
+            let loadedState = try Self.load()
+            guard loadedState.schemaVersion <= AppState.currentSchemaVersion else {
+                lastError = "This saved state belongs to a newer version of Roll Call. Update Roll Call before trying again."
+                return
+            }
+            await commitStateRecovery(loadedState, requireArchivedMatch: false)
+        } catch {
+            lastError = "Roll Call still could not read the saved state. The preserved recovery copy remains available. Error: \(error.localizedDescription)"
+        }
+    }
+
+    func restoreStateRecoverySnapshot(_ snapshot: StateRecoverySnapshot) async {
+        guard let recovery = stateRecovery, recovery.preservedStateURL != nil else {
+            lastError = "Roll Call could not preserve the original state file yet. Try again before restoring a backup."
+            return
+        }
+        var restoredState = snapshot.state
+        restoredState.appVersion = AppMetadata.appVersion
+        restoredState.deviceIdentity = state.deviceIdentity
+        restoredState.schemaVersion = max(restoredState.schemaVersion, AppState.currentSchemaVersion)
+        let recoveredSnapshotRecords = recovery.snapshots.map { snapshot in
+            SnapshotRecord(
+                id: UUID(uuidString: snapshot.url.deletingPathExtension().lastPathComponent) ?? UUID(),
+                createdAt: snapshot.createdAt,
+                reason: "Recovered backup",
+                relativeManifestPath: snapshot.url.lastPathComponent
+            )
+        }
+        let existingSnapshotPaths = Set(restoredState.snapshots.map(\.relativeManifestPath))
+        restoredState.snapshots.append(contentsOf: recoveredSnapshotRecords.filter {
+            !existingSnapshotPaths.contains($0.relativeManifestPath)
+        })
+        restoredState.snapshots = Array(restoredState.snapshots.prefix(10))
+        await commitStateRecovery(restoredState, requireArchivedMatch: true)
+    }
+
+    func startFreshAfterStateRecovery() async {
+        guard let recovery = stateRecovery, recovery.preservedStateURL != nil else {
+            lastError = "Roll Call will not replace the original state until a recovery copy has been preserved. Try again."
+            return
+        }
+        await commitStateRecovery(Self.freshEmptyState(), requireArchivedMatch: true)
+    }
+
+    func deleteStateRecoveryArchive(at url: URL) {
+        guard stateRecoveryArchives.contains(url),
+              url.lastPathComponent.hasPrefix("state-unreadable-"),
+              url.pathExtension == "json" else { return }
+        do {
+            try FileManager.default.removeItem(at: url)
+            stateRecoveryArchives = AppPaths.unreadableStateRecoveryFiles()
+        } catch {
+            lastError = "Roll Call could not remove that recovery copy. Error: \(error.localizedDescription)"
+        }
+    }
+
+    private func commitStateRecovery(_ replacement: AppState, requireArchivedMatch: Bool) async {
+        guard let recovery = stateRecovery,
+              let preservedStateURL = recovery.preservedStateURL else { return }
+
+        do {
+            let primaryData = try Data(contentsOf: recovery.primaryStateURL)
+            let preservedData = try Data(contentsOf: preservedStateURL)
+            if requireArchivedMatch && primaryData != preservedData {
+                lastError = "The original saved file changed before recovery completed. Roll Call left it untouched; try again."
+                return
+            }
+
+            state = replacement
+            normalizeRatingRequestPolicyState()
+            normalizeSelectedTeamIfNeeded()
+            normalizeAllTeams()
+            let result = await persistRecoveryStateAndWait(state, destinationURL: recovery.primaryStateURL)
+            switch result {
+            case .written:
+                latestDurablePersistenceSequence = latestRequestedPersistenceSequence
+                statePersistenceFailureEpisodeActive = false
+                guard let verifiedState = try? Self.load(),
+                      verifiedState.schemaVersion <= AppState.currentSchemaVersion else {
+                    lastError = "Roll Call could not verify the recovered state after writing it. The recovery screen remains available."
+                    return
+                }
+                state = verifiedState
+                stateRecovery = nil
+                stateRecoveryArchives = AppPaths.unreadableStateRecoveryFiles()
+                activateNormalStateLifecycle()
+                telemetry.record(.stateRecoveryTriggered, properties: [.reason: recovery.reason.rawValue])
+            case .failed(_, let message):
+                lastError = "Roll Call could not write the recovered state. Your original file remains preserved. Error: \(message)"
+            case .unconfirmed:
+                lastError = "Roll Call could not confirm the recovered state write. Your original file remains preserved."
+            }
+        } catch {
+            lastError = "Roll Call could not complete recovery. Your original file remains preserved. Error: \(error.localizedDescription)"
+        }
+    }
+
+    private func persistRecoveryStateAndWait(_ state: AppState, destinationURL: URL) async -> StatePersistenceResult {
+        persistSequence += 1
+        latestRequestedPersistenceSequence = persistSequence
+        return await persistenceWriter.enqueueAndWait(
+            state,
+            sequence: persistSequence,
+            destinationURL: destinationURL
+        )
     }
 
     var selectedTeamReadiness: ReadinessStatus? {
@@ -1730,7 +1886,7 @@ final class AppModel: ObservableObject {
         let currentClip = selectedTeam?.teamClips.first(where: { $0.id == customClip.id }) ?? customClip
         let cue = currentClip.playbackCue
         guard cueIsPlayable(cue) else {
-            telemetry.recordRepairNeeded(category: "customClip")
+            telemetry.recordRepairNeeded(category: "customClip", asynchronousPersistence: true)
             lastError = currentClip.readinessInputs.playback == .needsAppleMusic
                 ? "This Custom Clip needs Apple Music access on this device."
                 : "This Custom Clip needs repair before it can play."
@@ -2040,12 +2196,15 @@ final class AppModel: ObservableObject {
               let teamID = state.selectedTeamID,
               let team = state.teams.first(where: { $0.id == teamID }),
               let player = team.players.first(where: { $0.id == playerID }),
-              let cue = player.cue,
-              case .appleMusic(let source) = cue.source,
+              let clip = player.songAssignment?.privateClip,
+              case .appleMusic(let source) = clip.originalSource,
               source.isCatalogBacked != false,
               source.duration == nil else {
             return false
         }
+
+        let originalClipID = clip.id
+        let originalGenerationKey = clip.generationKey
 
         do {
             let resolved = try await catalogBackedResultResolver(MusicSearchResult(
@@ -2058,8 +2217,9 @@ final class AppModel: ObservableObject {
             ))
             guard let teamIndex = state.teams.firstIndex(where: { $0.id == teamID }),
                   let playerIndex = state.teams[teamIndex].players.firstIndex(where: { $0.id == playerID }),
-                  var currentCue = state.teams[teamIndex].players[playerIndex].cue,
-                  case .appleMusic(let currentSource) = currentCue.source,
+                  case .privateClip(let currentClip)? = state.teams[teamIndex].players[playerIndex].songAssignment,
+                  currentClip.id == originalClipID,
+                  case .appleMusic(let currentSource) = currentClip.originalSource,
                   currentSource == source else {
                 return false
             }
@@ -2072,8 +2232,12 @@ final class AppModel: ObservableObject {
             refreshedSource.previewURL = resolved.previewURL
             refreshedSource.isCatalogBacked = true
             refreshedSource.libraryPersistentID = nil
-            currentCue.source = .appleMusic(refreshedSource)
-            state.teams[teamIndex].players[playerIndex].cue = currentCue
+            var refreshedClip = currentClip
+            refreshedClip.originalSource = .appleMusic(refreshedSource)
+            guard refreshedClip.generationKey == originalGenerationKey else {
+                return false
+            }
+            state.teams[teamIndex].players[playerIndex].songAssignment = .privateClip(refreshedClip)
             persist()
             return true
         } catch {
@@ -2705,7 +2869,8 @@ final class AppModel: ObservableObject {
     }
 
     func refreshRecoveryState() {
-        if purgeExpiredRecentlyDeletedItems() {
+        stateRecoveryArchives = AppPaths.unreadableStateRecoveryFiles()
+        if stateRecovery == nil, purgeExpiredRecentlyDeletedItems() {
             persist()
         }
     }
@@ -4081,6 +4246,7 @@ final class AppModel: ObservableObject {
     }
 
     private func persist() {
+        guard stateRecovery == nil else { return }
         guard let request = makePersistenceRequest() else { return }
         Task(priority: .utility) { [persistenceWriter] in
             let result = await persistenceWriter.enqueue(
@@ -4114,6 +4280,7 @@ final class AppModel: ObservableObject {
     }
 
     private func makePersistenceRequest() -> PersistenceRequest? {
+        guard stateRecovery == nil else { return nil }
         let snapshot = state
         // Copy rather than drain. Every path is re-validated against the current
         // state before deletion, so carrying a path across more than one write is
@@ -4190,27 +4357,82 @@ final class AppModel: ObservableObject {
         return try decoder.decode(AppState.self, from: Data(contentsOf: AppPaths.stateURL()))
     }
 
-    private static func loadInitialState() -> (state: AppState, warning: String?, recoveryReason: String?) {
+    private static func loadInitialState() -> InitialStateLoadResult {
         do {
             let stateURL = try AppPaths.stateURL()
             guard FileManager.default.fileExists(atPath: stateURL.path) else {
-                return (freshEmptyState(), nil, nil)
+                return InitialStateLoadResult(state: freshEmptyState(), warning: nil, recoveryReason: nil, recovery: nil)
             }
             let loadedState = try load()
             guard loadedState.schemaVersion <= AppState.currentSchemaVersion else {
-                return (
-                    freshEmptyState(),
-                    preserveUnreadableStateFile(
-                        loadError: AppError.unsupportedSavedStateVersion
-                    ),
-                    "unsupportedSchema"
+                let preservedURL = preserveUnreadableStateFile()
+                return InitialStateLoadResult(
+                    state: freshEmptyState(),
+                    warning: nil,
+                    recoveryReason: StateRecoveryReason.unsupportedSchema.rawValue,
+                    recovery: makeStateRecoveryContext(
+                        reason: .unsupportedSchema,
+                        primaryStateURL: stateURL,
+                        preservedStateURL: preservedURL
+                    )
                 )
             }
-            return (loadedState, nil, nil)
+            return InitialStateLoadResult(state: loadedState, warning: nil, recoveryReason: nil, recovery: nil)
         } catch {
-            let recoveryMessage = preserveUnreadableStateFile(loadError: error)
-            return (freshEmptyState(), recoveryMessage, "loadFailure")
+            let stateURL = (try? AppPaths.stateURL()) ?? URL(fileURLWithPath: "state.json")
+            let preservedURL = preserveUnreadableStateFile()
+            return InitialStateLoadResult(
+                state: freshEmptyState(),
+                warning: nil,
+                recoveryReason: StateRecoveryReason.loadFailure.rawValue,
+                recovery: makeStateRecoveryContext(
+                    reason: .loadFailure,
+                    primaryStateURL: stateURL,
+                    preservedStateURL: preservedURL
+                )
+            )
         }
+    }
+
+    private static func makeStateRecoveryContext(
+        reason: StateRecoveryReason,
+        primaryStateURL: URL,
+        preservedStateURL: URL?
+    ) -> StateRecoveryContext? {
+        return StateRecoveryContext(
+            id: primaryStateURL,
+            reason: reason,
+            primaryStateURL: primaryStateURL,
+            preservedStateURL: preservedStateURL,
+            snapshots: recoverableStateSnapshots()
+        )
+    }
+
+    private static func recoverableStateSnapshots() -> [StateRecoverySnapshot] {
+        guard let snapshotsDirectory = try? AppPaths.snapshotsDirectory(),
+              let files = try? FileManager.default.contentsOfDirectory(
+                at: snapshotsDirectory,
+                includingPropertiesForKeys: [.contentModificationDateKey],
+                options: [.skipsHiddenFiles]
+              ) else {
+            return []
+        }
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        return files
+            .filter { $0.pathExtension.lowercased() == "json" }
+            .sorted { $0.lastPathComponent < $1.lastPathComponent }
+            .compactMap { url in
+                guard let data = try? Data(contentsOf: url),
+                      let snapshotState = try? decoder.decode(AppState.self, from: data),
+                      snapshotState.schemaVersion <= AppState.currentSchemaVersion else {
+                    return nil
+                }
+                let resourceValues = try? url.resourceValues(forKeys: [.contentModificationDateKey])
+                let createdAt = resourceValues?.contentModificationDate ?? .distantPast
+                return StateRecoverySnapshot(id: url, url: url, state: snapshotState, createdAt: createdAt)
+            }
     }
 
     private static func freshEmptyState() -> AppState {
@@ -4219,19 +4441,17 @@ final class AppModel: ObservableObject {
         return state
     }
 
-    private static func preserveUnreadableStateFile(loadError: Error) -> String {
-        let fallbackMessage = "Roll Call could not load saved app data. Your previous state file could not be decoded, so Roll Call preserved a recovery copy before starting from an empty state. Error: \(loadError.localizedDescription)"
-
+    private static func preserveUnreadableStateFile() -> URL? {
         do {
             let stateURL = try AppPaths.stateURL()
             guard FileManager.default.fileExists(atPath: stateURL.path) else {
-                return fallbackMessage
+                return nil
             }
             let recoveryURL = try AppPaths.unreadableStateRecoveryURL()
             try FileManager.default.copyItem(at: stateURL, to: recoveryURL)
-            return "Roll Call could not load saved app data. A recovery copy was saved as \(recoveryURL.lastPathComponent) before Roll Call started from an empty state. Error: \(loadError.localizedDescription)"
+            return recoveryURL
         } catch {
-            return "\(fallbackMessage) Recovery copy failed: \(error.localizedDescription)"
+            return nil
         }
     }
 

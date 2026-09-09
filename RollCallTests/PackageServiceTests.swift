@@ -1,5 +1,6 @@
 import XCTest
 @testable import RollCall
+import ZIPFoundation
 
 final class PackageServiceTests: XCTestCase {
     private var temp: RollCallTemporaryDirectory!
@@ -265,6 +266,108 @@ final class PackageServiceTests: XCTestCase {
         }
     }
 
+    func testArchivePreflightRejectsTraversalEntryPath() throws {
+        let sourceURL = temp.fileURL("entry.txt")
+        try Data("entry".utf8).write(to: sourceURL)
+        let packageURL = try writeArchive(
+            name: "TraversalEntry.rollcall",
+            entries: [(path: "../manifest.json", sourceURL: sourceURL, compressionMethod: .none)]
+        )
+
+        XCTAssertThrowsError(try service.preview(packageURL: packageURL)) { error in
+            XCTAssertAppError(error, is: .invalidImport)
+        }
+    }
+
+    func testArchivePreflightRejectsAbsoluteEntryPath() throws {
+        let sourceURL = temp.fileURL("entry.txt")
+        try Data("entry".utf8).write(to: sourceURL)
+        let packageURL = try writeArchive(
+            name: "AbsoluteEntry.rollcall",
+            entries: [(path: "/manifest.json", sourceURL: sourceURL, compressionMethod: .none)]
+        )
+
+        XCTAssertThrowsError(try service.preview(packageURL: packageURL)) { error in
+            XCTAssertAppError(error, is: .invalidImport)
+        }
+    }
+
+    func testArchivePreflightRejectsDuplicateEntryPaths() throws {
+        let sourceURL = temp.fileURL("entry.txt")
+        try Data("entry".utf8).write(to: sourceURL)
+        let packageURL = try writeArchive(
+            name: "DuplicateEntries.rollcall",
+            entries: [
+                (path: "manifest.json", sourceURL: sourceURL, compressionMethod: .none),
+                (path: "manifest.json", sourceURL: sourceURL, compressionMethod: .none)
+            ]
+        )
+
+        XCTAssertThrowsError(try service.preview(packageURL: packageURL)) { error in
+            XCTAssertAppError(error, is: .invalidImport)
+        }
+    }
+
+    func testArchivePreflightRejectsSymlinkEntries() throws {
+        let sourceURL = temp.fileURL("entry.txt")
+        try Data("entry".utf8).write(to: sourceURL)
+        let symlinkURL = temp.fileURL("link.txt")
+        try FileManager.default.createSymbolicLink(at: symlinkURL, withDestinationURL: sourceURL)
+        let packageURL = try writeArchive(
+            name: "SymlinkEntry.rollcall",
+            entries: [
+                (path: "manifest.json", sourceURL: sourceURL, compressionMethod: .none),
+                (path: "Assets/link.txt", sourceURL: symlinkURL, compressionMethod: .none)
+            ]
+        )
+
+        XCTAssertThrowsError(try service.preview(packageURL: packageURL)) { error in
+            XCTAssertAppError(error, is: .invalidImport)
+        }
+    }
+
+    func testArchivePreflightRejectsHighCompressionRatio() throws {
+        let sourceURL = temp.fileURL("high-ratio.bin")
+        try Data(repeating: 0, count: 2 * 1024 * 1024).write(to: sourceURL)
+        let packageURL = try writeArchive(
+            name: "HighRatio.rollcall",
+            entries: [(path: "payload.bin", sourceURL: sourceURL, compressionMethod: .deflate)]
+        )
+
+        XCTAssertThrowsError(try service.preview(packageURL: packageURL)) { error in
+            XCTAssertAppError(error, is: .invalidImport)
+        }
+    }
+
+    func testArchivePreflightRejectsExcessiveEntryCount() throws {
+        let sourceURL = temp.fileURL("entry.txt")
+        try Data("entry".utf8).write(to: sourceURL)
+        let entries = (0...1_024).map {
+            (path: "entry-\($0).txt", sourceURL: sourceURL, compressionMethod: CompressionMethod.none)
+        }
+        let packageURL = try writeArchive(name: "TooManyEntries.rollcall", entries: entries)
+
+        XCTAssertThrowsError(try service.preview(packageURL: packageURL)) { error in
+            XCTAssertAppError(error, is: .invalidImport)
+        }
+    }
+
+    func testArchivePreflightRejectsOversizedEntry() throws {
+        let sourceURL = temp.fileURL("oversized.bin")
+        FileManager.default.createFile(atPath: sourceURL.path, contents: nil)
+        let file = try FileHandle(forWritingTo: sourceURL)
+        try file.truncate(atOffset: 64 * 1024 * 1024 + 1)
+        try file.close()
+        let packageURL = try writeArchive(
+            name: "OversizedEntry.rollcall",
+            entries: [(path: "payload.bin", sourceURL: sourceURL, compressionMethod: .none)]
+        )
+
+        XCTAssertThrowsError(try service.preview(packageURL: packageURL)) { error in
+            XCTAssertAppError(error, is: .invalidImport)
+        }
+    }
+
     func testGeneratedCustomClipRoundTripsAsPortablePackageAsset() throws {
         let generatedPath = "GeneratedClips/team-warmup.m4a"
         try Data("portable-generated-audio".utf8)
@@ -418,6 +521,22 @@ final class PackageServiceTests: XCTestCase {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
         try encoder.encode(manifest).write(to: packageURL.appendingPathComponent("manifest.json"))
+        return packageURL
+    }
+
+    private func writeArchive(
+        name: String,
+        entries: [(path: String, sourceURL: URL, compressionMethod: CompressionMethod)]
+    ) throws -> URL {
+        let packageURL = temp.fileURL(name)
+        let archive = try Archive(url: packageURL, accessMode: .create)
+        for entry in entries {
+            try archive.addEntry(
+                with: entry.path,
+                fileURL: entry.sourceURL,
+                compressionMethod: entry.compressionMethod
+            )
+        }
         return packageURL
     }
 }

@@ -2,6 +2,19 @@ import Foundation
 import XCTest
 @testable import RollCall
 
+private final class TelemetryWriteProbe: @unchecked Sendable {
+    let lock = NSLock()
+    var writeCount = 0
+    var wasMainThread = false
+    var lastData: Data?
+
+    func snapshot() -> (writeCount: Int, wasMainThread: Bool, lastData: Data?) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (writeCount, wasMainThread, lastData)
+    }
+}
+
 @MainActor
 final class TelemetryTests: XCTestCase {
     private var temporaryDirectory: RollCallTemporaryDirectory!
@@ -417,7 +430,7 @@ final class TelemetryTests: XCTestCase {
         XCTAssertFalse(justBelowGap?.hasThreeMinuteGap == true)
     }
 
-    func testDoubleheaderCreatesTwoRawGamesButOneDateMilestone() {
+    func testDoubleheaderCreatesTwoRawGamesButOneDateMilestone() async {
         let (coordinator, provider, store) = makeCoordinator()
         let teamID = RollCallTestFixtures.teamID
         let playerIDs = [RollCallTestFixtures.alexID, RollCallTestFixtures.jordanID, RollCallTestFixtures.caseyID]
@@ -435,7 +448,7 @@ final class TelemetryTests: XCTestCase {
         // `true`, as `testStructuredPlaybackRequiresCorrelatedConfirmedStart` pins
         // down. This test previously read it as a qualification flag and so expected
         // `false` for the first three cues.
-        func playGame(start: Date) {
+        func playGame(start: Date) async {
             let probableGamesBefore = provider.signals.filter { $0.event == .gameProbable }.count
             for (index, playerID) in [playerIDs[0], playerIDs[1], playerIDs[2], playerIDs[0]].enumerated() {
                 let requestID = UUID()
@@ -453,6 +466,7 @@ final class TelemetryTests: XCTestCase {
                     ),
                     "Every confirmed cue must be recorded (cue \(index))."
                 )
+                await coordinator.waitForPendingPersistenceForTesting()
 
                 // The boundary: nothing qualifies until the fourth cue.
                 let probableGamesNow = provider.signals.filter { $0.event == .gameProbable }.count
@@ -464,9 +478,11 @@ final class TelemetryTests: XCTestCase {
             }
         }
 
-        playGame(start: base)
+        await playGame(start: base)
         coordinator.handleTeamBoundaryChange()
-        playGame(start: base.addingTimeInterval(1_800))
+        await coordinator.waitForPendingPersistenceForTesting()
+        await playGame(start: base.addingTimeInterval(1_800))
+        await coordinator.waitForPendingPersistenceForTesting()
 
         XCTAssertEqual(store.state.probableGameDates.count, 2)
         XCTAssertEqual(store.state.rating.probableGameDateKeys.count, 1)
@@ -622,7 +638,7 @@ final class TelemetryTests: XCTestCase {
         XCTAssertNil(LiveAnalyticsSessionReducer.accepting(checkpoint: checkpoint, selectedTeamID: teamID, now: now.addingTimeInterval(-1)))
     }
 
-    func testAllSixPlaybackDepthThresholdsRemainDistinct() {
+    func testAllSixPlaybackDepthThresholdsRemainDistinct() async {
         let (coordinator, provider, store) = makeCoordinator()
         let thresholds: [(Int, RollCallTelemetryEvent)] = [
             (10, .playerPlaybackCount10), (50, .playerPlaybackCount50), (100, .playerPlaybackCount100),
@@ -640,6 +656,7 @@ final class TelemetryTests: XCTestCase {
                 wasDebounced: false
             )
             XCTAssertTrue(coordinator.handlePlayerPlayback(teamID: RollCallTestFixtures.teamID, playerID: RollCallTestFixtures.alexID, result: result, now: RollCallTestFixtures.now))
+            await coordinator.waitForPendingPersistenceForTesting()
             XCTAssertTrue(provider.signals.contains { $0.event == event })
         }
     }
@@ -690,5 +707,185 @@ final class TelemetryTests: XCTestCase {
         XCTAssertEqual(coordinator.store.state.rating.automaticAttemptsConsumed, 1)
         XCTAssertNil(coordinator.store.state.rating.pendingPresentation)
         XCTAssertFalse(provider.signals.contains { $0.event == .ratingSheetShown })
+    }
+
+    func testTelemetryStoreSaveRunsFileWorkOffMainThread() {
+        let probe = TelemetryWriteProbe()
+        let store = TelemetryStore(url: temporaryDirectory.fileURL("off-main.json"), now: RollCallTestFixtures.now)
+        store.writeOverride = { data, _ in
+            probe.lock.lock()
+            probe.writeCount += 1
+            probe.wasMainThread = Thread.isMainThread
+            probe.lastData = data
+            probe.lock.unlock()
+        }
+
+        XCTAssertTrue(store.save())
+        let snapshot = probe.snapshot()
+        XCTAssertEqual(snapshot.writeCount, 1)
+        XCTAssertFalse(snapshot.wasMainThread)
+    }
+
+    func testLiveTelemetryWaitsForDurableWriteBeforeSending() async {
+        let (coordinator, provider, store) = makeCoordinator()
+        let probe = TelemetryWriteProbe()
+        let writerStarted = DispatchSemaphore(value: 0)
+        let releaseWriter = DispatchSemaphore(value: 0)
+        store.writeOverride = { data, _ in
+            probe.lock.lock()
+            probe.writeCount += 1
+            probe.wasMainThread = Thread.isMainThread
+            probe.lastData = data
+            probe.lock.unlock()
+            writerStarted.signal()
+            _ = releaseWriter.wait(timeout: .now() + 2)
+        }
+
+        coordinator.recordOnce(.liveEntered, asynchronousPersistence: true)
+        XCTAssertEqual(writerStarted.wait(timeout: .now() + 2), .success)
+        XCTAssertTrue(provider.signals.isEmpty)
+
+        releaseWriter.signal()
+        await coordinator.waitForPendingPersistenceForTesting()
+
+        let snapshot = probe.snapshot()
+        XCTAssertFalse(snapshot.wasMainThread)
+        XCTAssertNotNil(snapshot.lastData)
+        XCTAssertTrue(provider.signals.contains { $0.event == .liveEntered })
+    }
+
+    func testLiveTelemetryWritesRemainFIFOAndStopAfterFailure() async {
+        let (coordinator, provider, store) = makeCoordinator()
+        let firstWriteStarted = DispatchSemaphore(value: 0)
+        let releaseFirstWrite = DispatchSemaphore(value: 0)
+        let probe = TelemetryWriteProbe()
+        store.writeOverride = { data, _ in
+            probe.lock.lock()
+            probe.writeCount += 1
+            let writeNumber = probe.writeCount
+            probe.lastData = data
+            probe.lock.unlock()
+            if writeNumber == 1 {
+                firstWriteStarted.signal()
+                _ = releaseFirstWrite.wait(timeout: .now() + 2)
+            }
+        }
+
+        coordinator.recordOnce(.liveEntered, asynchronousPersistence: true)
+        coordinator.recordOnce(.playerPlaybackFirstSuccessful, asynchronousPersistence: true)
+        XCTAssertEqual(firstWriteStarted.wait(timeout: .now() + 2), .success)
+        XCTAssertTrue(provider.signals.isEmpty)
+        releaseFirstWrite.signal()
+        await coordinator.waitForPendingPersistenceForTesting()
+        XCTAssertEqual(provider.signals.map(\.event), [.liveEntered, .playerPlaybackFirstSuccessful])
+
+        store.writeOverride = { _, _ in throw NSError(domain: "test", code: 99) }
+        coordinator.recordOnce(.playerPlaybackCount10, asynchronousPersistence: true)
+        await coordinator.waitForPendingPersistenceForTesting()
+        XCTAssertTrue(store.state.suspended)
+        XCTAssertFalse(provider.signals.contains { $0.event == .playerPlaybackCount10 })
+        let writesAfterFailure = probe.writeCount
+
+        coordinator.recordOnce(.playerPlaybackCount50, asynchronousPersistence: true)
+        await coordinator.waitForPendingPersistenceForTesting()
+        XCTAssertEqual(probe.snapshot().writeCount, writesAfterFailure)
+    }
+
+    func testSynchronousStoreSaveHonorsAsyncFailureBarrier() async {
+        let store = TelemetryStore(url: temporaryDirectory.fileURL("shared-barrier.json"), now: RollCallTestFixtures.now)
+        store.writeOverride = { _, _ in throw NSError(domain: "test", code: 101) }
+
+        store.saveAsync(store.state) { _ in }
+        await store.waitForPendingWrites()
+
+        XCTAssertFalse(store.save(), "A synchronous compatibility save must not bypass a failed async revision.")
+    }
+
+    func testMixedSyncAndAsyncWritesKeepNewestDurableRollbackBaseline() async {
+        let (coordinator, _, store) = makeCoordinator()
+        let firstWriteStarted = DispatchSemaphore(value: 0)
+        let releaseFirstWrite = DispatchSemaphore(value: 0)
+        let probe = TelemetryWriteProbe()
+        store.writeOverride = { _, _ in
+            probe.lock.lock()
+            probe.writeCount += 1
+            let currentWrite = probe.writeCount
+            probe.lock.unlock()
+            if currentWrite == 1 {
+                firstWriteStarted.signal()
+                _ = releaseFirstWrite.wait(timeout: .now() + 2)
+            }
+        }
+
+        coordinator.recordOnce(.liveEntered, asynchronousPersistence: true)
+        XCTAssertEqual(firstWriteStarted.wait(timeout: .now() + 2), .success)
+        releaseFirstWrite.signal()
+
+        // This compatibility path is submitted after the async snapshot but
+        // before its main-actor completion can run. It must become the newer
+        // durable rollback baseline.
+        coordinator.recordOnce(.playerPlaybackFirstSuccessful)
+        await coordinator.waitForPendingPersistenceForTesting()
+        XCTAssertTrue(store.state.consumedInstallEvents.contains(RollCallTelemetryEvent.playerPlaybackFirstSuccessful.rawValue))
+
+        store.writeOverride = { _, _ in throw NSError(domain: "test", code: 102) }
+        coordinator.recordOnce(.playerPlaybackCount10, asynchronousPersistence: true)
+        await coordinator.waitForPendingPersistenceForTesting()
+
+        XCTAssertTrue(store.state.suspended)
+        XCTAssertTrue(
+            store.state.consumedInstallEvents.contains(RollCallTelemetryEvent.playerPlaybackFirstSuccessful.rawValue),
+            "A failed later revision must restore the newest successful synchronous state, not the older async snapshot."
+        )
+    }
+
+    func testPendingLiveSignalsAreBoundedAndSuspendFailClosed() async {
+        let (coordinator, provider, store) = makeCoordinator()
+        let writerStarted = DispatchSemaphore(value: 0)
+        let releaseWriter = DispatchSemaphore(value: 0)
+        store.writeOverride = { _, _ in
+            writerStarted.signal()
+            _ = releaseWriter.wait(timeout: .now() + 2)
+        }
+
+        coordinator.recordOnce(.liveEntered, asynchronousPersistence: true)
+        XCTAssertEqual(writerStarted.wait(timeout: .now() + 2), .success)
+        for _ in 0..<257 {
+            coordinator.record(.playerPlaybackFirstSuccessful)
+        }
+
+        XCTAssertTrue(store.state.suspended)
+        XCTAssertTrue(provider.signals.contains { $0.event == .telemetryStatePersistenceFailed })
+
+        releaseWriter.signal()
+        await coordinator.waitForPendingPersistenceForTesting()
+        XCTAssertFalse(provider.signals.contains { $0.event == .liveEntered })
+        XCTAssertFalse(provider.signals.contains { $0.event == .playerPlaybackFirstSuccessful })
+    }
+
+    func testOptOutInvalidatesSignalsQueuedBehindPendingWrite() async {
+        let (coordinator, provider, store) = makeCoordinator()
+        let writerStarted = DispatchSemaphore(value: 0)
+        let releaseWriter = DispatchSemaphore(value: 0)
+        store.writeOverride = { _, _ in
+            writerStarted.signal()
+            _ = releaseWriter.wait(timeout: .now() + 2)
+        }
+
+        coordinator.recordOnce(.liveEntered, asynchronousPersistence: true)
+        XCTAssertEqual(writerStarted.wait(timeout: .now() + 2), .success)
+        coordinator.record(.playerPlaybackFirstSuccessful)
+        coordinator.setAnalyticsEnabled(false)
+        coordinator.setAnalyticsEnabled(true)
+
+        releaseWriter.signal()
+        await coordinator.waitForPendingPersistenceForTesting()
+
+        XCTAssertEqual(
+            provider.signals.filter { $0.event == .analyticsPreferenceChanged }.map { $0.properties["newValue"] },
+            ["off", "on"]
+        )
+        XCTAssertFalse(provider.signals.contains { $0.event == .liveEntered })
+        XCTAssertFalse(provider.signals.contains { $0.event == .playerPlaybackFirstSuccessful })
     }
 }

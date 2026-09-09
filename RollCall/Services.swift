@@ -1008,7 +1008,7 @@ private final class MediaPlayerCatalogPlaybackController: AppleMusicCatalogPlayb
         category: "AppleMusicVolumeAutomation"
     )
 
-    private var capturedSystemVolumeBaseline: Float = 1
+    private var capturedVolumeBaseline: PlaybackVolumeBaseline?
     private var volumeAutomationEnabledForCurrentCue = true
     private var hasPendingVolumeRestore = false
 
@@ -1030,12 +1030,13 @@ private final class MediaPlayerCatalogPlaybackController: AppleMusicCatalogPlayb
     ) async throws {
         volumeAutomationEnabledForCurrentCue = volumeAutomationEnabled
         if volumeAutomationEnabled {
-            // Volume Automation must not touch Apple Music volume before playback starts.
-            // Capture the pre-cue baseline here, only apply volume changes once fade-out
-            // begins, then restore this exact baseline after playback has fully stopped.
-            captureSystemVolumeBaseline()
-            hasPendingVolumeRestore = true
+            // Keep the device output untouched before playback and anchor the fade to
+            // the MediaPlayer's own gain domain. AVAudioSession.outputVolume is retained
+            // for diagnostics, but it is not interchangeable with player.volume on all
+            // routes/devices.
+            captureVolumeBaselines()
         } else {
+            capturedVolumeBaseline = nil
             hasPendingVolumeRestore = false
         }
         player.stop()
@@ -1071,9 +1072,9 @@ private final class MediaPlayerCatalogPlaybackController: AppleMusicCatalogPlayb
     ) async throws {
         volumeAutomationEnabledForCurrentCue = volumeAutomationEnabled
         if volumeAutomationEnabled {
-            captureSystemVolumeBaseline()
-            hasPendingVolumeRestore = true
+            captureVolumeBaselines()
         } else {
+            capturedVolumeBaseline = nil
             hasPendingVolumeRestore = false
         }
         player.stop()
@@ -1093,24 +1094,30 @@ private final class MediaPlayerCatalogPlaybackController: AppleMusicCatalogPlayb
     }
 
     func setVolume(_ volume: Float) {
-        let clamped = min(max(0, volume), 1)
-        setPlayerVolume(capturedSystemVolumeBaseline * clamped)
+        guard let capturedVolumeBaseline else { return }
+        setPlayerVolume(capturedVolumeBaseline.playbackVolume(at: volume))
     }
 
     func restoreVolume() {
-        guard hasPendingVolumeRestore else { return }
-        setPlayerVolume(capturedSystemVolumeBaseline)
+        guard hasPendingVolumeRestore, let capturedVolumeBaseline else { return }
+        setPlayerVolume(capturedVolumeBaseline.playbackVolume)
         Self.logger.debug(
-            "Restored Apple Music player volume to captured baseline \(self.formattedVolume(self.capturedSystemVolumeBaseline), privacy: .public) after playback stopped"
+            "Restored Apple Music player volume to captured playback baseline \(self.formattedVolume(capturedVolumeBaseline.playbackVolume), privacy: .public); system output remained \(self.formattedVolume(capturedVolumeBaseline.systemOutputVolume), privacy: .public)"
         )
         hasPendingVolumeRestore = false
     }
 
     func discardPendingRestore() {
         guard hasPendingVolumeRestore else { return }
+        if let capturedVolumeBaseline {
+            // The engine calls this after stopping the outgoing player but before a
+            // replacement cue captures its baseline. Restore the player gain silently
+            // so a new cue cannot inherit a mid-fade value.
+            setPlayerVolume(capturedVolumeBaseline.playbackVolume)
+        }
         hasPendingVolumeRestore = false
         Self.logger.debug(
-            "Discarded pending Apple Music restore during cue handoff; next cue will recapture system volume baseline from \(self.formattedVolume(self.capturedSystemVolumeBaseline), privacy: .public)"
+            "Restored Apple Music playback baseline during cue handoff; next cue will recapture the current playback volume"
         )
     }
 
@@ -1132,11 +1139,34 @@ private final class MediaPlayerCatalogPlaybackController: AppleMusicCatalogPlayb
         throw PlaybackStartFailure(reason: .startTimedOut)
     }
 
-    private func captureSystemVolumeBaseline() {
-        capturedSystemVolumeBaseline = AVAudioSession.sharedInstance().outputVolume
-        Self.logger.debug(
-            "Captured system volume baseline \(self.formattedVolume(self.capturedSystemVolumeBaseline), privacy: .public) before Apple Music automation"
+    private func captureVolumeBaselines() {
+        let systemOutputVolume = AVAudioSession.sharedInstance().outputVolume
+        guard let playbackVolume = currentPlayerVolume() else {
+            capturedVolumeBaseline = nil
+            hasPendingVolumeRestore = false
+            return
+        }
+        capturedVolumeBaseline = PlaybackVolumeBaseline(
+            systemOutputVolume: systemOutputVolume,
+            playbackVolume: playbackVolume
         )
+        hasPendingVolumeRestore = true
+        Self.logger.debug(
+            "Captured Apple Music volume baselines: system output \(self.formattedVolume(systemOutputVolume), privacy: .public), playback \(self.formattedVolume(playbackVolume), privacy: .public)"
+        )
+    }
+
+    private func currentPlayerVolume() -> Float? {
+        guard Self.supportsVolumeGetter,
+              let number = player.value(forKey: "volume") as? NSNumber else {
+            Self.logger.error("Apple Music playback volume getter unavailable; volume automation is disabled for this cue")
+            return nil
+        }
+        guard number.floatValue.isFinite else {
+            Self.logger.error("Apple Music playback volume was non-finite; volume automation is disabled for this cue")
+            return nil
+        }
+        return min(max(0, number.floatValue), 1)
     }
 
     private func formattedVolume(_ volume: Float) -> String {
@@ -1155,6 +1185,9 @@ private final class MediaPlayerCatalogPlaybackController: AppleMusicCatalogPlayb
     /// degrades to "no volume automation" instead of a crash in front of a crowd.
     private static let supportsVolumeSetter: Bool =
         MPMusicPlayerController.instancesRespond(to: NSSelectorFromString("setVolume:"))
+
+    private static let supportsVolumeGetter: Bool =
+        MPMusicPlayerController.instancesRespond(to: NSSelectorFromString("volume"))
 
     private func setPlayerVolume(_ volume: Float) {
         guard Self.supportsVolumeSetter else { return }
@@ -1194,6 +1227,25 @@ struct PlaybackFadeSchedule: Equatable {
             postFadeStopDelay: boundedTailGuard,
             stopDelay: stopDelay
         )
+    }
+}
+
+struct PlaybackVolumeBaseline: Equatable {
+    let systemOutputVolume: Float
+    let playbackVolume: Float
+
+    init(systemOutputVolume: Float, playbackVolume: Float) {
+        self.systemOutputVolume = Self.clamp(systemOutputVolume, fallback: 1)
+        self.playbackVolume = Self.clamp(playbackVolume, fallback: 1)
+    }
+
+    func playbackVolume(at normalizedFade: Float) -> Float {
+        playbackVolume * Self.clamp(normalizedFade, fallback: 0)
+    }
+
+    private static func clamp(_ value: Float, fallback: Float) -> Float {
+        guard value.isFinite else { return fallback }
+        return min(max(0, value), 1)
     }
 }
 
@@ -1436,8 +1488,8 @@ final class CuePlaybackEngine: NSObject, ObservableObject {
         sourceBackedVolumeAutomationEnabled: Bool,
         tracksProgress: Bool = false
     ) -> UUID {
-        // When replacing one cue with another, keep the outgoing cue from briefly
-        // restoring its old Apple Music volume before the new cue captures its own anchor.
+        // When replacing one cue with another, stop the outgoing cue first, then restore
+        // its playback baseline before the new cue captures its own anchor.
         stop(restoresCatalogVolume: false)
         catalogPlaybackController.discardPendingRestore()
         let sessionID = UUID()
@@ -1981,6 +2033,12 @@ extension CueSource {
 
 @MainActor
 final class ReadinessService {
+    static let lowVolumeThreshold: Float = 0.30
+
+    static func isLowVolume(_ volume: Float) -> Bool {
+        volume < lowVolumeThreshold
+    }
+
     private let audioAssetService: AudioAssetService
     private let monitor = NWPathMonitor()
     private let queue = DispatchQueue(label: "RollCall.Readiness")
@@ -2010,29 +2068,41 @@ final class ReadinessService {
         let session = AVAudioSession.sharedInstance()
         let route = session.currentRoute.outputs.first?.portName ?? "Unknown"
         let volume = session.outputVolume
+        let isLowVolume = Self.isLowVolume(volume)
         let presentPlayers = team?.presentPlayersInBattingOrder ?? []
         let appleMusicCount = presentPlayers.compactMap { team?.cue(for: $0) }.filter { cue in
             if case .appleMusic = cue.source { return true }
             return false
         }.count
         let musicAuthStatus = MusicAuthorization.currentStatus
-        let playerChecks = presentPlayers.compactMap { readinessCheck(for: $0, team: team) }
-        let customChecks = customAnnouncerChecks(for: team)
+        let playerChecks = presentPlayers.flatMap { readinessChecks(for: $0, team: team) }
         let optionalChecks = optionalUpgradeChecks(for: team)
         return ReadinessStatus(
             generatedAt: .now,
             checks: [
                 ReadinessCheck(id: "route", title: "Audio Route", detail: route == "Unknown" ? "Choose your speaker before live use." : route, state: route == "Unknown" ? .issue : .gameDayCheck, category: .audioRoute),
-                ReadinessCheck(id: "volume", title: "Volume", detail: volume < 0.30 ? "Please check your volume - it appears low." : "\(Int(volume * 100))%", state: volume < 0.30 ? .issue : .gameDayCheck, category: .volume),
+                ReadinessCheck(id: "volume", title: "Volume", detail: isLowVolume ? "Please check your volume - it appears low." : "\(Int(volume * 100))%", state: isLowVolume ? .issue : .gameDayCheck, category: .volume),
                 ReadinessCheck(id: "network", title: "Apple Music Network", detail: appleMusicCount == 0 ? "No Apple Music cues in today's lineup." : (pathStatus == .satisfied ? "Connection available." : "Connection unavailable. Apple Music cues may fail."), state: appleMusicCount == 0 ? .gameDayCheck : (pathStatus == .satisfied ? .gameDayCheck : .issue), category: .network),
                 ReadinessCheck(id: "music-auth", title: "Apple Music Access", detail: appleMusicCount == 0 ? "No Apple Music cues assigned." : appleMusicAuthorizationDetail(for: musicAuthStatus), state: readinessStateForMusic(status: musicAuthStatus, appleMusicCount: appleMusicCount), category: .appleMusicAccess, action: musicAuthStatus == .notDetermined && appleMusicCount > 0 ? .requestAppleMusicAccess : .none),
                 ReadinessCheck(id: "lineup", title: "Present Players", detail: "\(presentPlayers.count) players marked present", state: team == nil || presentPlayers.isEmpty ? .issue : .gameDayCheck, category: .lineup),
-            ] + playerChecks + customChecks + optionalChecks,
+            ] + playerChecks + optionalChecks,
             teamID: team?.id
         )
     }
 
-    private func readinessCheck(for player: Player, team: Team?) -> ReadinessCheck? {
+    private func readinessChecks(for player: Player, team: Team?) -> [ReadinessCheck] {
+        guard let audioCheck = playerAudioReadinessCheck(for: player, team: team) else {
+            return []
+        }
+
+        guard audioCheck.state == .ready || audioCheck.state == .enhanced else {
+            return [audioCheck]
+        }
+
+        return [audioCheck, announcementReadinessCheck(for: player)].compactMap { $0 }
+    }
+
+    private func playerAudioReadinessCheck(for player: Player, team: Team?) -> ReadinessCheck? {
         guard let team else { return nil }
         guard player.songAssignment != nil else {
             return ReadinessCheck(id: "player-\(player.id)-needs-audio", title: player.displayName, detail: "Add a song or local audio. Game Day can still use Small Cheer fallback.", state: .needsAudio, category: .playerAudio, playerID: player.id)
@@ -2102,11 +2172,6 @@ final class ReadinessService {
     }
 
     private func playerReadinessCheck(for player: Player, detail: String) -> ReadinessCheck {
-        if let customAnnouncerRelativePath = player.customAnnouncerRelativePath,
-           !audioAssetService.assetExists(relativePath: customAnnouncerRelativePath) {
-            return ReadinessCheck(id: "player-\(player.id)-custom-announcer-issue", title: player.displayName, detail: "The Announcement Cue file is missing from app storage.", state: .issue, category: .playerAnnouncement, playerID: player.id)
-        }
-
         if hasStoredCustomAnnouncer(for: player) {
             return ReadinessCheck(
                 id: "player-\(player.id)-enhanced",
@@ -2124,25 +2189,29 @@ final class ReadinessService {
         )
     }
 
-    private func customAnnouncerChecks(for team: Team?) -> [ReadinessCheck] {
-        guard let team else { return [] }
-        let presentPlayers = team.presentPlayersInBattingOrder
-        guard !presentPlayers.isEmpty else { return [] }
-        let readyPlayers = presentPlayers.filter { player in
-            guard team.cue(for: player) != nil else { return false }
-            return readinessCheck(for: player, team: team)?.state != .issue
+    private func announcementReadinessCheck(for player: Player) -> ReadinessCheck? {
+        if let customAnnouncerRelativePath = player.customAnnouncerRelativePath {
+            guard audioAssetService.assetExists(relativePath: customAnnouncerRelativePath) else {
+                return ReadinessCheck(
+                    id: "player-\(player.id)-custom-announcer-issue",
+                    title: player.displayName,
+                    detail: "The Announcement Cue file is missing from app storage.",
+                    state: .issue,
+                    category: .playerAnnouncement,
+                    playerID: player.id
+                )
+            }
+            return nil
         }
-        guard !readyPlayers.isEmpty else { return [] }
 
-        return readyPlayers.compactMap { player in
-            guard !hasStoredCustomAnnouncer(for: player) else { return nil }
-            return ReadinessCheck(
-                id: "player-\(player.id)-announcement-upgrade",
-                title: player.displayName,
-                detail: "Add an Announcement Cue to make this walkup feel more stadium-like.",
-                state: .optional, category: .playerAnnouncement, playerID: player.id
-            )
-        }
+        return ReadinessCheck(
+            id: "player-\(player.id)-announcement-upgrade",
+            title: player.displayName,
+            detail: "Add an Announcement Cue to make this walkup feel more stadium-like.",
+            state: .optional,
+            category: .playerAnnouncement,
+            playerID: player.id
+        )
     }
 
     private func readinessStateForMusic(status: MusicAuthorization.Status, appleMusicCount: Int) -> ReadinessState {
@@ -2196,6 +2265,16 @@ final class ReadinessService {
 }
 
 struct PackageService: Sendable {
+    private enum ArchiveLimits {
+        // These limits are intentionally above the normal size of a team export,
+        // while keeping an untrusted archive from reserving unbounded resources.
+        static let maximumArchiveBytes: UInt64 = 256 * 1024 * 1024
+        static let maximumEntryCount = 1_024
+        static let maximumEntryUncompressedBytes: UInt64 = 64 * 1024 * 1024
+        static let maximumTotalUncompressedBytes: UInt64 = 512 * 1024 * 1024
+        static let maximumCompressionRatio: UInt64 = 1_000
+    }
+
     struct PreviewResult {
         var manifest: TeamPackageManifest
         var summary: PackageTransferSummary
@@ -2627,6 +2706,7 @@ struct PackageService: Sendable {
         if try isDirectory(packageURL) {
             return nil
         }
+        try validateArchiveBeforeExtraction(at: packageURL)
         let extractedURL = FileManager.default.temporaryDirectory.appendingPathComponent("RollCall-Import-\(UUID().uuidString)", isDirectory: true)
         if FileManager.default.fileExists(atPath: extractedURL.path) {
             try FileManager.default.removeItem(at: extractedURL)
@@ -2639,6 +2719,85 @@ struct PackageService: Sendable {
             try? FileManager.default.removeItem(at: extractedURL)
             throw error
         }
+    }
+
+    private func validateArchiveBeforeExtraction(at packageURL: URL) throws {
+        let values = try packageURL.resourceValues(forKeys: [.fileSizeKey])
+        guard let fileSize = values.fileSize,
+              fileSize >= 0,
+              UInt64(fileSize) <= ArchiveLimits.maximumArchiveBytes else {
+            throw AppError.invalidImport
+        }
+
+        let archive: Archive
+        do {
+            archive = try Archive(url: packageURL, accessMode: .read)
+        } catch {
+            throw AppError.invalidImport
+        }
+
+        var entryCount = 0
+        var totalUncompressedBytes: UInt64 = 0
+        var normalizedPaths = Set<String>()
+        for entry in archive {
+            entryCount += 1
+            guard entryCount <= ArchiveLimits.maximumEntryCount else {
+                throw AppError.invalidImport
+            }
+
+            let path = entry.path
+            guard isSafeArchiveEntryPath(path, type: entry.type) else {
+                throw AppError.invalidImport
+            }
+
+            let normalizedPath = path.precomposedStringWithCanonicalMapping.lowercased()
+            guard normalizedPaths.insert(normalizedPath).inserted else {
+                throw AppError.invalidImport
+            }
+
+            let uncompressedBytes = entry.uncompressedSize
+            guard entry.type != .symlink,
+                  uncompressedBytes <= ArchiveLimits.maximumEntryUncompressedBytes else {
+                throw AppError.invalidImport
+            }
+            guard uncompressedBytes <= ArchiveLimits.maximumTotalUncompressedBytes - totalUncompressedBytes else {
+                throw AppError.invalidImport
+            }
+            totalUncompressedBytes += uncompressedBytes
+
+            let compressedBytes = entry.compressedSize
+            if uncompressedBytes > 0 {
+                guard compressedBytes > 0,
+                      compressedBytes <= UInt64.max / ArchiveLimits.maximumCompressionRatio,
+                      uncompressedBytes <= compressedBytes * ArchiveLimits.maximumCompressionRatio else {
+                    throw AppError.invalidImport
+                }
+            }
+        }
+    }
+
+    private func isSafeArchiveEntryPath(_ path: String, type: Entry.EntryType) -> Bool {
+        guard !path.isEmpty,
+              !path.contains("\0"),
+              !path.contains("\\"),
+              !path.hasPrefix("/"),
+              !path.hasPrefix("\\"),
+              path.range(of: "^[A-Za-z]:/", options: .regularExpression) == nil else {
+            return false
+        }
+
+        let components = path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        let semanticComponents: ArraySlice<String>
+        if type == .directory, path.hasSuffix("/") {
+            semanticComponents = components.dropLast()
+        } else {
+            semanticComponents = components[...]
+        }
+        guard !semanticComponents.isEmpty,
+              semanticComponents.allSatisfy({ !$0.isEmpty && $0 != "." && $0 != ".." }) else {
+            return false
+        }
+        return type == .directory || !path.hasSuffix("/")
     }
 
     private func manifestURL(for packageURL: URL) throws -> URL {

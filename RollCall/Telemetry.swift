@@ -655,6 +655,10 @@ struct TelemetryStoreState: Codable, Equatable {
     }
 }
 
+// Snapshots are copied before crossing into the persistence queue. The
+// contained Foundation value types are immutable for the duration of a write.
+extension TelemetryStoreState: @unchecked Sendable {}
+
 enum TelemetryStoreLoadStatus: Equatable {
     case new
     case loaded
@@ -663,12 +667,50 @@ enum TelemetryStoreLoadStatus: Equatable {
     case unavailable
 }
 
-final class TelemetryStore {
+private final class TelemetrySynchronousWriteResult: @unchecked Sendable {
+    let semaphore = DispatchSemaphore(value: 0)
+    private let lock = NSLock()
+    private var _didSave = false
+
+    var didSave: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return _didSave
+    }
+
+    func complete(_ didSave: Bool) {
+        lock.lock()
+        _didSave = didSave
+        lock.unlock()
+        semaphore.signal()
+    }
+}
+
+final class TelemetryStore: @unchecked Sendable {
     let url: URL
     private let fileManager: FileManager
+    private let writeQueue = DispatchQueue(
+        label: "com.rollcall.telemetry.persistence",
+        qos: .utility
+    )
+    private let writeOverrideLock = NSLock()
+    private var _writeOverride: ((Data, URL) throws -> Void)?
+    private let asyncWriteStateLock = NSLock()
+    private var asyncWriteBlocked = false
     var state: TelemetryStoreState
     private(set) var status: TelemetryStoreLoadStatus
-    var writeOverride: ((Data, URL) throws -> Void)?
+    var writeOverride: ((Data, URL) throws -> Void)? {
+        get {
+            writeOverrideLock.lock()
+            defer { writeOverrideLock.unlock() }
+            return _writeOverride
+        }
+        set {
+            writeOverrideLock.lock()
+            _writeOverride = newValue
+            writeOverrideLock.unlock()
+        }
+    }
 
     init(
         url: URL,
@@ -722,6 +764,71 @@ final class TelemetryStore {
     @discardableResult
     func save(_ candidate: TelemetryStoreState? = nil) -> Bool {
         let value = candidate ?? state
+        let result = TelemetrySynchronousWriteResult()
+        writeQueue.async { [weak self] in
+            guard let self else {
+                result.complete(false)
+                return
+            }
+            guard !self.persistenceIsBlocked() else {
+                result.complete(false)
+                return
+            }
+            let didSave = self.write(value)
+            if !didSave { self.blockPersistenceAfterFailure() }
+            result.complete(didSave)
+        }
+        result.semaphore.wait()
+        let didSave = result.didSave
+        if didSave { state = value }
+        return didSave
+    }
+
+    /// Persists a snapshot in submission order without encoding or writing on
+    /// the caller's actor. The completion is delivered on the main actor.
+    func saveAsync(
+        _ candidate: TelemetryStoreState,
+        completion: @escaping @MainActor @Sendable (Bool) -> Void
+    ) {
+        writeQueue.async { [weak self] in
+            guard let self else { return }
+            let didSave: Bool
+            if self.persistenceIsBlocked() {
+                didSave = false
+            } else {
+                didSave = self.write(candidate)
+                if !didSave { self.blockPersistenceAfterFailure() }
+            }
+            DispatchQueue.main.async {
+                completion(didSave)
+            }
+        }
+    }
+
+    /// Reopens the async writer only after an explicit retry has been chosen.
+    func resetAsyncPersistenceAfterFailure() {
+        writeQueue.sync {
+            resetPersistenceFailure()
+        }
+    }
+
+    /// Prevents both synchronous and asynchronous writes from bypassing a
+    /// failed revision. The serial queue observes this barrier before each
+    /// write.
+    func blockAsyncPersistenceAfterFailure() {
+        blockPersistenceAfterFailure()
+    }
+
+    /// Test/support hook that waits for all writes submitted before the call.
+    func waitForPendingWrites() async {
+        await withCheckedContinuation { continuation in
+            writeQueue.async {
+                continuation.resume()
+            }
+        }
+    }
+
+    private func write(_ value: TelemetryStoreState) -> Bool {
         do {
             let encoder = JSONEncoder()
             encoder.dateEncodingStrategy = .iso8601
@@ -733,11 +840,28 @@ final class TelemetryStore {
             } else {
                 try data.write(to: url, options: .atomic)
             }
-            state = value
             return true
         } catch {
             return false
         }
+    }
+
+    private func persistenceIsBlocked() -> Bool {
+        asyncWriteStateLock.lock()
+        defer { asyncWriteStateLock.unlock() }
+        return asyncWriteBlocked
+    }
+
+    private func blockPersistenceAfterFailure() {
+        asyncWriteStateLock.lock()
+        asyncWriteBlocked = true
+        asyncWriteStateLock.unlock()
+    }
+
+    private func resetPersistenceFailure() {
+        asyncWriteStateLock.lock()
+        asyncWriteBlocked = false
+        asyncWriteStateLock.unlock()
     }
 }
 
@@ -935,6 +1059,15 @@ final class RollCallTelemetryCoordinator {
     private var monotonicActivityDeadline: ContinuousClock.Instant?
     private var recoveryReported = false
     private var volatileManualRatingPresentation: PendingRatingPresentation?
+    private var pendingAsyncPersistenceCount = 0
+    private var pendingAsyncSignals: [(generation: Int, event: RollCallTelemetryEvent, properties: [RollCallTelemetryProperty: String])] = []
+    private var asyncPersistenceFailed = false
+    private var persistenceGeneration = 0
+    private var lastDurableState: TelemetryStoreState
+    private var nextPersistenceRevision = 0
+    private var lastDurableRevision = 0
+    private let maximumPendingAsyncPersistences = 32
+    private let maximumPendingAsyncSignals = 256
 
     init(
         provider: RollCallTelemetryProvider,
@@ -949,8 +1082,9 @@ final class RollCallTelemetryCoordinator {
         self.preference = preference
         self.buildContext = buildContext
         self.ordinaryRecordingGate = preference.isEnabled
+        self.lastDurableState = store.state
         provider.configure(enabled: ordinaryRecordingGate, context: buildContext)
-        if store.status == .recovered, !store.save() {
+        if store.status == .recovered, !persistSynchronously() {
             suspendAfterPersistenceFailure()
         }
         recoverUnresolvedPresentationIfNeeded(now: .now)
@@ -1113,16 +1247,21 @@ final class RollCallTelemetryCoordinator {
         if clip.sourceLineageClipID != nil { recordOnce(.mediaClipReuseFirstUsed) }
     }
 
-    func recordRepairNeeded(category: String) {
+    func recordRepairNeeded(category: String, asynchronousPersistence: Bool = false) {
         guard isRepairCategory(category) else { return }
-        recordOnce(.repairFirstNeeded, properties: [.category: category], key: "repairNeeded|\(category)")
+        recordOnce(
+            .repairFirstNeeded,
+            properties: [.category: category],
+            key: "repairNeeded|\(category)",
+            asynchronousPersistence: asynchronousPersistence
+        )
     }
 
     func recordRepairAttempted(category: String) {
         guard isRepairCategory(category), isAvailableForProductPolicy else { return }
         var candidate = store.state
         guard candidate.consumedInstallEvents.insert("repairAttempted|\(category)").inserted else { return }
-        guard store.save(candidate) else { suspendAfterPersistenceFailure(); return }
+        guard persistSynchronously(candidate) else { suspendAfterPersistenceFailure(); return }
     }
 
     func recordRepairCompleted(category: String) {
@@ -1151,7 +1290,7 @@ final class RollCallTelemetryCoordinator {
             candidate.consumedInstallEvents.insert(RollCallTelemetryEvent.packageExportCount5.rawValue)
             if !ordinaryRecordingGate { candidate.suppressedEvents.insert(RollCallTelemetryEvent.packageExportCount5.rawValue) }
         }
-        guard store.save(candidate) else { suspendAfterPersistenceFailure(); return }
+        guard persistSynchronously(candidate) else { suspendAfterPersistenceFailure(); return }
         if crossedFirst { record(.packageFirstExport) }
         if crossedFifth { record(.packageExportCount5) }
     }
@@ -1172,7 +1311,7 @@ final class RollCallTelemetryCoordinator {
             candidate.consumedInstallEvents.insert(RollCallTelemetryEvent.packageImportCount5.rawValue)
             if !ordinaryRecordingGate { candidate.suppressedEvents.insert(RollCallTelemetryEvent.packageImportCount5.rawValue) }
         }
-        guard store.save(candidate) else { suspendAfterPersistenceFailure(); return }
+        guard persistSynchronously(candidate) else { suspendAfterPersistenceFailure(); return }
         if crossedFirst { record(.packageFirstImport, properties: [.hadMissingMedia: hadMissingMedia ? "true" : "false"]) }
         if crossedFifth { record(.packageImportCount5) }
     }
@@ -1191,13 +1330,14 @@ final class RollCallTelemetryCoordinator {
             if isFirst { candidate.suppressedEvents.insert(RollCallTelemetryEvent.playlistSyncFirstUsed.rawValue) }
             if isMultiple { candidate.suppressedEvents.insert(RollCallTelemetryEvent.playlistSyncUsedInMultipleTeams.rawValue) }
         }
-        guard store.save(candidate) else { suspendAfterPersistenceFailure(); return }
+        guard persistSynchronously(candidate) else { suspendAfterPersistenceFailure(); return }
         if isFirst { record(.playlistSyncFirstUsed) }
         if isMultiple { record(.playlistSyncUsedInMultipleTeams) }
     }
 
     func setAnalyticsEnabled(_ enabled: Bool) {
         guard enabled != preference.isEnabled else { return }
+        persistenceGeneration += 1
         if !enabled {
             ordinaryRecordingGate = false
             preference.persist(false)
@@ -1212,6 +1352,22 @@ final class RollCallTelemetryCoordinator {
     }
 
     func record(
+        _ event: RollCallTelemetryEvent,
+        properties: [RollCallTelemetryProperty: String] = [:]
+    ) {
+        guard ordinaryRecordingGate, isAvailableForProductPolicy else { return }
+        if pendingAsyncPersistenceCount > 0 {
+            guard pendingAsyncSignals.count < maximumPendingAsyncSignals else {
+                suspendAfterAsyncPersistenceFailure()
+                return
+            }
+            pendingAsyncSignals.append((persistenceGeneration, event, properties))
+            return
+        }
+        recordImmediately(event, properties: properties)
+    }
+
+    private func recordImmediately(
         _ event: RollCallTelemetryEvent,
         properties: [RollCallTelemetryProperty: String] = [:]
     ) {
@@ -1233,12 +1389,87 @@ final class RollCallTelemetryCoordinator {
         provider.send(signal)
     }
 
+    /// Keeps legacy synchronous callers on the same serial writer and
+    /// advances the coordinator's durable rollback baseline only after the
+    /// write has succeeded. The revision prevents an older async completion
+    /// from restoring over a newer synchronous write.
+    @discardableResult
+    private func persistSynchronously(_ candidate: TelemetryStoreState? = nil) -> Bool {
+        let value = candidate ?? store.state
+        nextPersistenceRevision += 1
+        let revision = nextPersistenceRevision
+        guard store.save(value) else { return false }
+        if revision > lastDurableRevision {
+            lastDurableState = value
+            lastDurableRevision = revision
+        }
+        return true
+    }
+
+    /// Stages a live-use snapshot immediately, then persists it on the serial
+    /// background writer. Signals recorded while this snapshot is pending are
+    /// held until the write succeeds, preserving persist-before-send.
+    @discardableResult
+    private func persistLive(_ candidate: TelemetryStoreState) -> Bool {
+        guard !asyncPersistenceFailed,
+              pendingAsyncPersistenceCount < maximumPendingAsyncPersistences else {
+            if pendingAsyncPersistenceCount >= maximumPendingAsyncPersistences {
+                suspendAfterAsyncPersistenceFailure()
+            }
+            return false
+        }
+        nextPersistenceRevision += 1
+        let revision = nextPersistenceRevision
+        store.state = candidate
+        pendingAsyncPersistenceCount += 1
+        store.saveAsync(candidate) { [weak self] didSave in
+            guard let self else { return }
+            self.pendingAsyncPersistenceCount = max(0, self.pendingAsyncPersistenceCount - 1)
+            guard didSave, !self.asyncPersistenceFailed else {
+                self.suspendAfterAsyncPersistenceFailure()
+                return
+            }
+            if revision > self.lastDurableRevision {
+                self.lastDurableState = candidate
+                self.lastDurableRevision = revision
+            }
+            guard self.pendingAsyncPersistenceCount == 0 else { return }
+            let generation = self.persistenceGeneration
+            let signals = self.pendingAsyncSignals
+            self.pendingAsyncSignals.removeAll()
+            for pending in signals where pending.generation == generation {
+                self.recordImmediately(pending.event, properties: pending.properties)
+            }
+        }
+        return true
+    }
+
+    private func suspendAfterAsyncPersistenceFailure() {
+        guard !asyncPersistenceFailed else { return }
+        asyncPersistenceFailed = true
+        persistenceGeneration += 1
+        pendingAsyncSignals.removeAll()
+        store.blockAsyncPersistenceAfterFailure()
+        store.state = lastDurableState
+        suspendAfterPersistenceFailure()
+    }
+
+    /// Allows focused tests to wait for the serial writer and its main-actor
+    /// completion callbacks without making production playback async.
+    func waitForPendingPersistenceForTesting() async {
+        await store.waitForPendingWrites()
+        while pendingAsyncPersistenceCount > 0 {
+            await Task.yield()
+        }
+    }
+
     func recordOnce(
         _ event: RollCallTelemetryEvent,
         properties: [RollCallTelemetryProperty: String] = [:],
         key: String? = nil,
         teamID: UUID? = nil,
-        gameKey: String? = nil
+        gameKey: String? = nil,
+        asynchronousPersistence: Bool = false
     ) {
         guard store.status != .unsupported,
               store.status != .unavailable,
@@ -1271,9 +1502,13 @@ final class RollCallTelemetryCoordinator {
         if !ordinaryRecordingGate || !isAvailableForProductPolicy {
             candidate.suppressedEvents.insert(identity)
         }
-        guard store.save(candidate) else {
-            suspendAfterPersistenceFailure()
-            return
+        if asynchronousPersistence {
+            guard persistLive(candidate) else { return }
+        } else {
+            guard persistSynchronously(candidate) else {
+                suspendAfterPersistenceFailure()
+                return
+            }
         }
         guard ordinaryRecordingGate, isAvailableForProductPolicy else { return }
         record(event, properties: properties)
@@ -1319,7 +1554,7 @@ final class RollCallTelemetryCoordinator {
         if !ordinaryRecordingGate || !isAvailableForProductPolicy {
             candidate.suppressedEvents.formUnion(uniqueSignals.map(\.deDuplicationIdentity))
         }
-        guard store.save(candidate) else { suspendAfterPersistenceFailure(); return }
+        guard persistSynchronously(candidate) else { suspendAfterPersistenceFailure(); return }
         guard ordinaryRecordingGate, isAvailableForProductPolicy else { return }
         for signal in uniqueSignals {
             record(
@@ -1333,7 +1568,7 @@ final class RollCallTelemetryCoordinator {
         guard !recoveryReported,
               store.status == .recovered,
               store.state.schemaVersion == TelemetryStoreState.currentSchemaVersion else { return }
-        guard store.save() else { suspendAfterPersistenceFailure(); return }
+        guard persistSynchronously() else { suspendAfterPersistenceFailure(); return }
         recoveryReported = true
         record(.telemetryStateRecovered)
     }
@@ -1348,9 +1583,13 @@ final class RollCallTelemetryCoordinator {
     }
 
     func retryPersistence() -> Bool {
+        guard pendingAsyncPersistenceCount == 0 else { return false }
         var candidate = store.state
         candidate.suspended = false
-        guard store.save(candidate) else { return false }
+        store.resetAsyncPersistenceAfterFailure()
+        guard persistSynchronously(candidate) else { return false }
+        asyncPersistenceFailed = false
+        lastDurableState = candidate
         ordinaryRecordingGate = preference.isEnabled
         return true
     }
@@ -1368,7 +1607,7 @@ final class RollCallTelemetryCoordinator {
             var candidate = store.state
             candidate.retentionEvents.insert(event.rawValue)
             if !ordinaryRecordingGate { candidate.suppressedEvents.insert(event.rawValue) }
-            guard store.save(candidate) else { suspendAfterPersistenceFailure(); return }
+            guard persistSynchronously(candidate) else { suspendAfterPersistenceFailure(); return }
             record(event, properties: [.enrollmentCohort: store.state.enrollmentCohort])
         }
         observeRatingEligibility(at: now)
@@ -1388,7 +1627,7 @@ final class RollCallTelemetryCoordinator {
             .automaticAttemptNumber: String(opportunity),
             .ratingPolicyVersion: "1"
         ]
-        guard store.save(candidate) else { suspendAfterPersistenceFailure(); return }
+        guard persistSynchronously(candidate) else { suspendAfterPersistenceFailure(); return }
         record(.ratingBecameEligible, properties: properties)
     }
 
@@ -1397,7 +1636,7 @@ final class RollCallTelemetryCoordinator {
         if store.state.liveCheckpoint?.selectedTeamID != teamID {
             handleTeamBoundaryChange()
         }
-        recordOnce(.liveEntered)
+        recordOnce(.liveEntered, asynchronousPersistence: true)
         guard store.state.liveCheckpoint == nil else { return }
         // Entering a surface is not meaningful activity, so no checkpoint is created here.
         _ = now
@@ -1429,10 +1668,7 @@ final class RollCallTelemetryCoordinator {
         if let deadline = monotonicActivityDeadline, now > deadline {
             var candidate = store.state
             candidate.liveCheckpoint = nil
-            guard store.save(candidate) else {
-                suspendAfterPersistenceFailure()
-                return false
-            }
+            guard persistLive(candidate) else { return false }
             monotonicActivityDeadline = nil
         }
         monotonicActivityDeadline = now.advanced(by: .seconds(Int64(LiveAnalyticsSessionReducer.timeout)))
@@ -1444,10 +1680,7 @@ final class RollCallTelemetryCoordinator {
               ContinuousClock().now > deadline else { return true }
         var candidate = store.state
         candidate.liveCheckpoint = nil
-        guard store.save(candidate) else {
-            suspendAfterPersistenceFailure()
-            return false
-        }
+        guard persistLive(candidate) else { return false }
         monotonicActivityDeadline = nil
         return false
     }
@@ -1458,21 +1691,20 @@ final class RollCallTelemetryCoordinator {
         guard store.state.liveCheckpoint != nil else { return true }
         var candidate = store.state
         candidate.liveCheckpoint = nil
-        guard store.save(candidate) else {
-            suspendAfterPersistenceFailure()
-            return false
-        }
+        guard persistLive(candidate) else { return false }
         return true
     }
 
     /// Records one confirmed player cue against the live analytics session.
     ///
-    /// - Returns: whether the cue was **accepted and recorded** — not whether it
-    ///   qualified a probable game. A single confirmed cue returns `true` even
-    ///   though four are required to qualify. Rejections (uncorrelated request id,
-    ///   no confirmed start, cancelled, debounced, wrong team, stale checkpoint)
-    ///   return `false`. Probable-game qualification is observable only through the
-    ///   emitted `game.probable` signal and `probableGameDates`, never from here.
+    /// - Returns: whether the cue was **accepted for ordered persistence** — not
+    ///   whether it qualified a probable game. Live persistence is intentionally
+    ///   nonblocking; dependent signals are released only after the snapshot is
+    ///   durable. A single confirmed cue returns `true` even though four are
+    ///   required to qualify. Rejections (uncorrelated request id, no confirmed
+    ///   start, cancelled, debounced, wrong team, stale checkpoint) return `false`.
+    ///   Probable-game qualification is observable only through the emitted
+    ///   `game.probable` signal and `probableGameDates`, never from here.
     @discardableResult
     func handlePlayerPlayback(
         teamID: UUID,
@@ -1594,7 +1826,7 @@ final class RollCallTelemetryCoordinator {
                 .ratingPolicyVersion: "1"
             ]))
         }
-        guard store.save(candidate) else { suspendAfterPersistenceFailure(); return false }
+        guard persistLive(candidate) else { return false }
         for (event, properties) in events { record(event, properties: properties) }
         return true
     }
@@ -1634,7 +1866,7 @@ final class RollCallTelemetryCoordinator {
         var candidate = store.state
         candidate.liveCheckpoint = checkpoint
         let events = checkpoint.didQualify ? gameFeatureEvents(from: checkpoint, candidate: &candidate) : []
-        guard store.save(candidate) else { suspendAfterPersistenceFailure(); return }
+        guard persistLive(candidate) else { return }
         for (event, properties) in events { record(event, properties: properties) }
     }
 
@@ -1749,7 +1981,7 @@ final class RollCallTelemetryCoordinator {
             checkpoint.emittedFeatureKeys.insert("emitted:failure:\(key)")
         }
         candidate.liveCheckpoint = checkpoint
-        guard store.save(candidate) else { suspendAfterPersistenceFailure(); return }
+        guard persistLive(candidate) else { return }
         if checkpoint.didQualify {
             record(.gameCompletePlaybackFailureObserved, properties: [.sourceFamily: sourceFamily.rawValue, .reason: reason.rawValue])
         }
@@ -1787,7 +2019,7 @@ final class RollCallTelemetryCoordinator {
         }
         var candidate = store.state
         candidate.liveCheckpoint = checkpoint
-        guard store.save(candidate) else { suspendAfterPersistenceFailure(); return }
+        guard persistLive(candidate) else { return }
         guard checkpoint.didQualify else { return }
         record(.gameRecoveryPathUsed, properties: [
             .failedComponent: failedComponent.rawValue,
@@ -1805,7 +2037,7 @@ final class RollCallTelemetryCoordinator {
         if var checkpoint = candidate.liveCheckpoint {
             if checkpoint.selectedTeamID != teamID {
                 candidate.liveCheckpoint = nil
-                guard store.save(candidate) else { suspendAfterPersistenceFailure(); return }
+                guard persistLive(candidate) else { return }
                 checkpoint = LiveAnalyticsCheckpoint(
                     selectedTeamID: teamID, firstQualifyingCueAt: now, latestQualifyingCueAt: now,
                     distinctPlayerIDs: [], qualifyingCueCount: 0, hasThreeMinuteGap: false,
@@ -1846,11 +2078,11 @@ final class RollCallTelemetryCoordinator {
         }
         if let checkpoint = candidate.liveCheckpoint, checkpoint.didQualify {
             let events = gameFeatureEvents(from: checkpoint, candidate: &candidate)
-            guard store.save(candidate) else { suspendAfterPersistenceFailure(); return }
+            guard persistLive(candidate) else { return }
             for (event, properties) in events { record(event, properties: properties) }
             return
         }
-        guard store.save(candidate) else { suspendAfterPersistenceFailure(); return }
+        guard persistLive(candidate) else { return }
     }
 
     func handleLineupActivity(teamID: UUID, now: Date = .now, edited: Bool = false) {
@@ -1894,10 +2126,10 @@ final class RollCallTelemetryCoordinator {
         candidate.liveCheckpoint = checkpoint
         if checkpoint.didQualify {
             let events = gameFeatureEvents(from: checkpoint, candidate: &candidate)
-            guard store.save(candidate) else { suspendAfterPersistenceFailure(); return }
+            guard persistLive(candidate) else { return }
             for (event, properties) in events { record(event, properties: properties) }
         } else {
-            guard store.save(candidate) else { suspendAfterPersistenceFailure(); return }
+            guard persistLive(candidate) else { return }
         }
     }
 
@@ -1910,7 +2142,7 @@ final class RollCallTelemetryCoordinator {
             var candidate = store.state
             let token = UUID()
             candidate.rating.pendingPresentation = PendingRatingPresentation(token: token, source: source, automaticAttemptNumber: attempt, reservedAt: now)
-            return store.save(candidate) ? token : nil
+            return persistSynchronously(candidate) ? token : nil
         }
         let token = UUID()
         let pending = PendingRatingPresentation(token: token, source: source, automaticAttemptNumber: nil, reservedAt: now)
@@ -1923,7 +2155,7 @@ final class RollCallTelemetryCoordinator {
         }
         var candidate = store.state
         candidate.rating.pendingPresentation = pending
-        return store.save(candidate) ? token : nil
+        return persistSynchronously(candidate) ? token : nil
     }
 
     func confirmRatingPresentation(token: UUID, now: Date = .now) {
@@ -1949,7 +2181,10 @@ final class RollCallTelemetryCoordinator {
         if isVolatileManual {
             store.state = candidate
         } else {
-            guard store.save(candidate) else { suspendAfterPersistenceFailure(); return }
+            guard persistSynchronously(candidate) else {
+                suspendAfterPersistenceFailure()
+                return
+            }
         }
         var properties: [RollCallTelemetryProperty: String] = [
             .source: pending.source.rawValue,
@@ -1972,7 +2207,7 @@ final class RollCallTelemetryCoordinator {
               token == nil || pending.token == token else { return }
         var candidate = store.state
         candidate.rating.pendingPresentation = nil
-        guard store.save(candidate) else {
+        guard persistSynchronously(candidate) else {
             suspendAfterPersistenceFailure()
             return
         }
@@ -1985,7 +2220,10 @@ final class RollCallTelemetryCoordinator {
             store.state = candidate
             return
         }
-        guard store.save(candidate) else { suspendAfterPersistenceFailure(); return }
+        guard persistSynchronously(candidate) else {
+            suspendAfterPersistenceFailure()
+            return
+        }
     }
 
     func recordRatingAction(_ event: RollCallTelemetryEvent, suppressesAutomatic: Bool) {
@@ -2002,7 +2240,7 @@ final class RollCallTelemetryCoordinator {
         if pending.source == .automatic {
             candidate.rating.automaticAttemptsConsumed = min(2, candidate.rating.automaticAttemptsConsumed + 1)
         }
-        guard store.save(candidate) else {
+        guard persistSynchronously(candidate) else {
             suspendAfterPersistenceFailure()
             return
         }

@@ -90,6 +90,88 @@ final class AppStatePersistenceTests: XCTestCase {
         ))
     }
 
+    @MainActor
+    func testUnreadableStateRemainsUntouchedUntilRecoveryChoice() async throws {
+        let originalBytes = Data("not-json".utf8)
+        try originalBytes.write(to: AppPaths.stateURL(), options: .atomic)
+
+        let model = AppModel()
+
+        let recovery = try XCTUnwrap(model.stateRecovery)
+        XCTAssertTrue(model.requiresStateRecoveryDecision)
+        XCTAssertEqual(try Data(contentsOf: AppPaths.stateURL()), originalBytes)
+        let preservedStateURL = try XCTUnwrap(recovery.preservedStateURL)
+        XCTAssertEqual(try Data(contentsOf: preservedStateURL), originalBytes)
+
+        await model.flushLatestState()
+        XCTAssertEqual(try Data(contentsOf: AppPaths.stateURL()), originalBytes)
+
+        await model.startFreshAfterStateRecovery()
+        await model.flushLatestState()
+
+        XCTAssertFalse(model.requiresStateRecoveryDecision)
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        XCTAssertTrue(try decoder.decode(AppState.self, from: Data(contentsOf: AppPaths.stateURL())).teams.isEmpty)
+        XCTAssertEqual(try Data(contentsOf: preservedStateURL), originalBytes)
+    }
+
+    @MainActor
+    func testFutureSchemaStateRemainsUntouchedAndOffersRecovery() throws {
+        var futureState = RollCallTestFixtures.appState(team: RollCallTestFixtures.team())
+        futureState.schemaVersion = AppState.currentSchemaVersion + 1
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        let originalBytes = try encoder.encode(futureState)
+        try originalBytes.write(to: AppPaths.stateURL(), options: .atomic)
+
+        let model = AppModel()
+
+        let recovery = try XCTUnwrap(model.stateRecovery)
+        XCTAssertEqual(recovery.reason, .unsupportedSchema)
+        XCTAssertEqual(try Data(contentsOf: AppPaths.stateURL()), originalBytes)
+        XCTAssertEqual(try Data(contentsOf: try XCTUnwrap(recovery.preservedStateURL)), originalBytes)
+        XCTAssertTrue(model.state.teams.isEmpty)
+    }
+
+    @MainActor
+    func testValidLegacyStateStillLoadsAndCanBePersisted() async throws {
+        var legacyState = RollCallTestFixtures.appState(team: RollCallTestFixtures.team())
+        legacyState.schemaVersion = 1
+        try writeState(legacyState)
+
+        let model = AppModel()
+
+        XCTAssertNil(model.stateRecovery)
+        XCTAssertEqual(model.state.teams.first?.name, legacyState.teams.first?.name)
+        await model.flushLatestState()
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        let savedState = try decoder.decode(AppState.self, from: Data(contentsOf: AppPaths.stateURL()))
+        XCTAssertEqual(savedState.schemaVersion, AppState.currentSchemaVersion)
+        XCTAssertEqual(savedState.teams.first?.name, legacyState.teams.first?.name)
+    }
+
+    @MainActor
+    func testUnreadableStateCanDiscoverAndRestoreIndependentSnapshot() async throws {
+        let originalBytes = Data("not-json".utf8)
+        try originalBytes.write(to: AppPaths.stateURL(), options: .atomic)
+        let snapshotState = RollCallTestFixtures.appState(team: RollCallTestFixtures.team())
+        let snapshotURL = try writeRecoverySnapshot(snapshotState, fileName: "orphan-snapshot.json")
+
+        let model = AppModel()
+
+        let recovery = try XCTUnwrap(model.stateRecovery)
+        let snapshot = try XCTUnwrap(recovery.snapshots.first(where: { $0.url == snapshotURL }))
+        await model.restoreStateRecoverySnapshot(snapshot)
+        await model.flushLatestState()
+
+        XCTAssertFalse(model.requiresStateRecoveryDecision)
+        XCTAssertEqual(model.state.teams.first?.name, snapshotState.teams.first?.name)
+        XCTAssertEqual(try Data(contentsOf: try XCTUnwrap(recovery.preservedStateURL)), originalBytes)
+    }
+
     func testWhatsNewReleaseIdentityStaysWithinMajorMinorFamily() {
         XCTAssertEqual(AppMetadata.releaseFamily(for: "1.2.1"), "1.2")
         XCTAssertTrue(AppMetadata.hasSeenWhatsNewRelease("1.2 (76)", for: "1.2.1"))
@@ -341,6 +423,172 @@ final class AppStatePersistenceTests: XCTestCase {
     }
 
     @MainActor
+    func testAppleMusicMetadataRefreshPreservesPreparedClipState() async throws {
+        let (originalPlayer, originalClip) = preparedAppleMusicPlayer()
+        try writeState(RollCallTestFixtures.appState(
+            team: RollCallTestFixtures.team(players: [originalPlayer])
+        ))
+
+        let resolver = DeferredAppleMusicCatalogResolver()
+        let model = AppModel(
+            appleMusicPlaybackCapabilityResolver: { .fullSong },
+            catalogBackedResultResolver: { result in
+                try await resolver.resolve(result)
+            }
+        )
+        let refreshTask = Task { @MainActor in
+            await model.refreshAppleMusicCueMetadata(for: originalPlayer.id)
+        }
+        await resolver.waitForRequest()
+
+        resolver.complete(with: MusicSearchResult(
+            songID: "catalog.prepared",
+            title: "Resolved Song",
+            artistName: "Resolved Artist",
+            duration: 210,
+            previewURL: nil,
+            isCatalogBacked: true
+        ))
+
+        let didRefresh = await refreshTask.value
+        XCTAssertTrue(didRefresh)
+        let refreshedPlayer = try XCTUnwrap(
+            model.selectedTeam?.players.first(where: { $0.id == originalPlayer.id })
+        )
+        let refreshedClip = try XCTUnwrap(refreshedPlayer.songAssignment?.privateClip)
+        XCTAssertEqual(refreshedClip.id, originalClip.id)
+        XCTAssertEqual(refreshedClip.displayName, originalClip.displayName)
+        XCTAssertEqual(refreshedClip.requestedSelection, originalClip.requestedSelection)
+        XCTAssertEqual(refreshedClip.pauseAfterAnnouncer, originalClip.pauseAfterAnnouncer)
+        XCTAssertEqual(refreshedClip.generatedAsset, originalClip.generatedAsset)
+        XCTAssertEqual(refreshedClip.readinessInputs, originalClip.readinessInputs)
+        XCTAssertEqual(refreshedClip.portabilityInputs, originalClip.portabilityInputs)
+        XCTAssertEqual(refreshedClip.retryMetadata, originalClip.retryMetadata)
+        XCTAssertEqual(refreshedClip.policy, originalClip.policy)
+        XCTAssertEqual(refreshedClip.sourceLineageClipID, originalClip.sourceLineageClipID)
+        XCTAssertEqual(refreshedClip.generationKey, originalClip.generationKey)
+        XCTAssertTrue(refreshedClip.hasCurrentGeneratedAsset)
+        guard case .appleMusic(let source) = refreshedClip.originalSource else {
+            return XCTFail("Expected the refreshed clip to remain Apple Music-backed.")
+        }
+        XCTAssertEqual(source.title, "Resolved Song")
+        XCTAssertEqual(source.artistName, "Resolved Artist")
+        XCTAssertEqual(source.duration, 210)
+    }
+
+    @MainActor
+    func testAppleMusicMetadataRefreshRejectsGenerationKeyChangeWithoutMutatingClip() async throws {
+        let (originalPlayer, originalClip) = preparedAppleMusicPlayer()
+        try writeState(RollCallTestFixtures.appState(
+            team: RollCallTestFixtures.team(players: [originalPlayer])
+        ))
+
+        let resolver = DeferredAppleMusicCatalogResolver()
+        let model = AppModel(
+            appleMusicPlaybackCapabilityResolver: { .fullSong },
+            catalogBackedResultResolver: { result in
+                try await resolver.resolve(result)
+            }
+        )
+        let refreshTask = Task { @MainActor in
+            await model.refreshAppleMusicCueMetadata(for: originalPlayer.id)
+        }
+        await resolver.waitForRequest()
+
+        resolver.complete(with: MusicSearchResult(
+            songID: "catalog.different",
+            title: "Different Song",
+            artistName: "Different Artist",
+            duration: 210,
+            previewURL: nil,
+            isCatalogBacked: true
+        ))
+
+        let didRefresh = await refreshTask.value
+        XCTAssertFalse(didRefresh)
+        XCTAssertEqual(model.selectedTeam?.songClip(for: originalPlayer), originalClip)
+    }
+
+    @MainActor
+    func testAppleMusicMetadataRefreshRejectsCompletionForReplacementWithSameSource() async throws {
+        let (originalPlayer, originalClip) = preparedAppleMusicPlayer()
+        try writeState(RollCallTestFixtures.appState(
+            team: RollCallTestFixtures.team(players: [originalPlayer])
+        ))
+
+        let resolver = DeferredAppleMusicCatalogResolver()
+        let model = AppModel(
+            appleMusicPlaybackCapabilityResolver: { .fullSong },
+            catalogBackedResultResolver: { result in
+                try await resolver.resolve(result)
+            }
+        )
+        let refreshTask = Task { @MainActor in
+            await model.refreshAppleMusicCueMetadata(for: originalPlayer.id)
+        }
+        await resolver.waitForRequest()
+
+        var replacementCue = originalClip.editingCue
+        replacementCue.id = UUID()
+        model.saveSongCue(replacementCue, to: originalPlayer.id)
+        let replacementPlayer = try XCTUnwrap(
+            model.selectedTeam?.players.first(where: { $0.id == originalPlayer.id })
+        )
+        let replacementClip = try XCTUnwrap(replacementPlayer.songAssignment?.privateClip)
+        XCTAssertNotEqual(replacementClip.id, originalClip.id)
+
+        resolver.complete(with: MusicSearchResult(
+            songID: "catalog.prepared",
+            title: "Resolved Song",
+            artistName: "Resolved Artist",
+            duration: 210,
+            previewURL: nil,
+            isCatalogBacked: true
+        ))
+
+        let didRefresh = await refreshTask.value
+        XCTAssertFalse(didRefresh)
+        let currentPlayer = try XCTUnwrap(
+            model.selectedTeam?.players.first(where: { $0.id == originalPlayer.id })
+        )
+        XCTAssertEqual(currentPlayer.songAssignment?.privateClip, replacementClip)
+    }
+
+    @MainActor
+    func testExplicitAppleMusicReplacementStillCreatesFreshClip() throws {
+        let (originalPlayer, originalClip) = preparedAppleMusicPlayer()
+        try writeState(RollCallTestFixtures.appState(
+            team: RollCallTestFixtures.team(players: [originalPlayer])
+        ))
+        let model = AppModel()
+
+        var replacementCue = RollCallTestFixtures.appleMusicCue(
+            id: UUID(),
+            songID: "catalog.replacement",
+            title: "Replacement Song",
+            artistName: "Replacement Artist"
+        )
+        guard case .appleMusic(var source) = replacementCue.source else {
+            return XCTFail("Expected an Apple Music replacement source.")
+        }
+        source.duration = nil
+        replacementCue.source = .appleMusic(source)
+        model.saveSongCue(replacementCue, to: originalPlayer.id)
+
+        let replacementPlayer = try XCTUnwrap(
+            model.selectedTeam?.players.first(where: { $0.id == originalPlayer.id })
+        )
+        let replacementClip = try XCTUnwrap(replacementPlayer.songAssignment?.privateClip)
+        XCTAssertNotEqual(replacementClip.id, originalClip.id)
+        XCTAssertNil(replacementClip.generatedAsset.relativePath)
+        XCTAssertEqual(replacementClip.generatedAsset.status, .none)
+        XCTAssertEqual(replacementClip.readinessInputs.playback, .sourceBackedReady)
+        XCTAssertEqual(replacementClip.portabilityInputs.portability, .sourceReferenceOnly)
+        XCTAssertEqual(replacementClip.retryMetadata, .none)
+        XCTAssertNil(replacementClip.sourceLineageClipID)
+    }
+
+    @MainActor
     func testAppleMusicPreviewIgnoresOlderResultWhenNewerPreviewFinishesFirst() async throws {
         try writeState(RollCallTestFixtures.appState())
 
@@ -416,6 +664,62 @@ final class AppStatePersistenceTests: XCTestCase {
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
         encoder.dateEncodingStrategy = .iso8601
         try encoder.encode(state).write(to: AppPaths.stateURL(), options: .atomic)
+    }
+
+    private func writeRecoverySnapshot(_ state: AppState, fileName: String) throws -> URL {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+        encoder.dateEncodingStrategy = .iso8601
+        let url = try AppPaths.snapshotsDirectory().appendingPathComponent(fileName)
+        try encoder.encode(state).write(to: url, options: .atomic)
+        return url
+    }
+
+    private func preparedAppleMusicPlayer() -> (player: Player, clip: SongClip) {
+        var cue = RollCallTestFixtures.appleMusicCue(
+            id: UUID(),
+            songID: "catalog.prepared",
+            title: "Prepared Song",
+            artistName: "Prepared Artist"
+        )
+        guard case .appleMusic(var source) = cue.source else {
+            preconditionFailure("Expected an Apple Music source.")
+        }
+        source.duration = nil
+        cue.source = .appleMusic(source)
+
+        var clip = SongClip(cue: cue)
+        clip.generatedAsset = GeneratedClipAsset(
+            relativePath: "GeneratedClips/prepared-song.m4a",
+            status: .ready,
+            renderedSelection: clip.requestedSelection,
+            generationKey: clip.generationKey,
+            generatedAt: RollCallTestFixtures.now
+        )
+        clip.readinessInputs = SongClipReadinessInputs(
+            playback: .localClipReady,
+            sourceAvailableOnDevice: true,
+            downloadedOnDevice: true
+        )
+        clip.portabilityInputs = SongClipPortabilityInputs(
+            portability: .portableLocalClip,
+            generatedAssetCanBeExported: true
+        )
+        clip.retryMetadata = SongClipRetryMetadata(
+            attemptCount: 2,
+            lastAttemptAt: RollCallTestFixtures.now,
+            nextRetryAt: RollCallTestFixtures.now.addingTimeInterval(60),
+            lastFailureCode: SongClipPreparationFailureCode.transientSystemFailure.rawValue
+        )
+
+        var player = RollCallTestFixtures.player(
+            id: RollCallTestFixtures.alexID,
+            name: "Alex Ramirez",
+            number: "12",
+            cue: cue
+        )
+        player.songAssignment = .privateClip(clip)
+        return (player, clip)
     }
 
     func testLegacyPlayerCueDecodesAsPrivateSongAssignment() throws {
